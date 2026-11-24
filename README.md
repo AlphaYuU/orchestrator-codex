@@ -51,11 +51,11 @@ orchestrator-codex/
 
 ---
 
-## Installation / 本地全局安装（软链接同步）
+## Installation / 本地全局安装（实时同步）
 
-Clone this repository locally, then mount `skills/orchestrator-codex` into Antigravity's global skills folder `~/.gemini/config/skills/orchestrator-codex`. Using a symlink / directory junction ensures any local edits take effect immediately.
+Clone this repository locally, then register `skills/orchestrator-codex` globally in Antigravity so any local edits take effect immediately without copying files.
 
-### macOS / Linux
+### macOS / Linux (Symlink / 软链接)
 
 ```bash
 git clone https://github.com/AlphaYuU/orchestrator-codex.git ~/orchestrator-codex
@@ -69,20 +69,33 @@ Verify / 验证：
 ls -la ~/.gemini/config/skills/orchestrator-codex/SKILL.md
 ```
 
-### Windows (PowerShell — Directory Junction, No Admin Required)
+### Windows (Recommended: `~/.gemini/config/skills.json` Manifest)
+
+> **Why not `mklink /J` / Directory Junction on Windows?** Antigravity's file scanner silently skips Windows NTFS Directory Junctions (`ReparsePoint` / `ModeIrregular`). Registering the real directory via Antigravity's official global discovery manifest `~/.gemini/config/skills.json` works across Antigravity App, CLI (`agy`), and IDE with zero copying and no admin rights required.
+>
+> **为什么 Windows 不推荐目录联接（Junction）？** Antigravity 底层扫描器在 Windows 上会静默跳过 NTFS Junction；使用官方全局清单 `~/.gemini/config/skills.json` 直接指向仓库真实路径即可零复制实时生效，且无需管理员权限（注意保存为 **UTF-8 无 BOM**）。
 
 ```powershell
 git clone https://github.com/AlphaYuU/orchestrator-codex.git D:\Project\Skill\orchestrator-codex
-New-Item -ItemType Directory -Force "$HOME\.gemini\config\skills" | Out-Null
-New-Item -ItemType Junction -Path "$HOME\.gemini\config\skills\orchestrator-codex" -Target "D:\Project\Skill\orchestrator-codex\skills\orchestrator-codex"
+New-Item -ItemType Directory -Force "$HOME\.gemini\config" | Out-Null
+
+# Writes BOM-free UTF-8 skills.json (if skills.json already exists, merge the entry into "entries")
+$json = @'
+{
+  "entries": [
+    {
+      "path": "D:\\Project\\Skill\\orchestrator-codex\\skills"
+    }
+  ]
+}
+'@
+[System.IO.File]::WriteAllText("$HOME\.gemini\config\skills.json", "$json`n", (New-Object System.Text.UTF8Encoding($false)))
 ```
 
 Verify / 验证：
 
-```powershell
-Get-Item "$HOME\.gemini\config\skills\orchestrator-codex" | Select-Object FullName, LinkType, Target
-Test-Path "$HOME\.gemini\config\skills\orchestrator-codex\SKILL.md"
-```
+- **Antigravity CLI (`agy`)**: Run `/skills reload`, then `/skills` and confirm `orchestrator-codex` is listed.
+- **Antigravity App / IDE**: Open **Customizations → Installed** (or **Settings → Projects → Customizations**) and confirm `orchestrator-codex` appears with a **Global** badge.
 
 ### Optional: Add `AGENTS.md` to Your Target Project / 可选：项目根目录规范
 
