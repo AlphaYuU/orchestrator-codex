@@ -1,0 +1,29 @@
+# Agent collaboration scratch artifacts
+.agent-collab/
+
+# OS temporary files
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Editor & IDE temporary files
+*.swp
+*.swo
+*~
+*.tmp
+*.bak
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
