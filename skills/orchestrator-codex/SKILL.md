@@ -1,157 +1,177 @@
 ---
 name: orchestrator-codex
 description: >-
-  Orchestrate a dual-window Gemini (Antigravity) + Codex CLI workflow where Gemini
-  serves as orchestrator, sole human interface, and frontend/UI lead while treating
-  an interactive Codex CLI window (or native `app-server` daemon-managed thread on
-  isolated sandbox desktops) as a behind-the-scenes backend Subagent via `codex queue`,
-  with desktop-aware launching (user-specified model, reasoning effort, and task-aligned
-  permissions), graceful daemon thread lifecycle (`thread/start`, `thread/resume`,
-  `thread/loaded/list`, `thread/unsubscribe`), on-demand history session resume,
-  automated thread UUID discovery/binding, completion polling, ask-don't-guess
-  clarification gates, tiered Git branch governance, and strict diff-based acceptance review.
-  Trigger when coordinating full-stack features, dispatching backend/logic/audit work
-  to Codex ("派给 Codex", "delegate to Codex", "双窗口协作"), launching, resuming,
-  stopping, or reconfiguring a Codex Subagent session, or inspecting Codex output
-  ("验收", "review Codex diff"). Do NOT trigger for small inline edits (<= 10 lines),
-  pure frontend UI/CSS/animation/copy work, general Q&A or code explanations, or when
-  the user asks to implement everything directly in a single agent without Codex.
+  Coordinate Antigravity (Gemini) and a Codex CLI backend subagent via project-owned
+  thread UUIDs. Use for explicit Codex delegation, session management, and independent
+  acceptance of backend, logic, or audit work. Gemini owns user communication and
+  frontend decisions. Keep small intuitive edits, frontend-only work, general Q&A,
+  and user-requested single-agent work in Gemini.
 ---
 
-# Orchestrator-Codex Dual-Window Subagent Workflow
+# Orchestrator-Codex Dual-Window Workflow
 
-Gemini (Antigravity) is the **Orchestrator Lead, Sole Human Interface, and Frontend/Aesthetic Owner**. Codex CLI (in a standalone visible window on the main desktop, or hosted natively inside Codex's persistent local `app-server` daemon on an isolated sandbox desktop) is strictly Gemini's **behind-the-scenes Backend Subagent**, driven via `codex queue` using resolved session **UUIDs**.
+Gemini leads the workflow, owns the frontend and user-facing copy, and communicates with the user. Codex handles backend logic, scripts, audits, and tests within the work order. Gemini manages Git, dispatch, and independent review.
 
-## 1. Highest-Priority Principles: Sole Interface & Ask-Don't-Guess
+## 1. Clarify scope and agree on a branch
 
-1. **Sole Human Interface**: Only Gemini communicates with the user. Codex never asks the user directly or delivers final conclusions; Codex reports solely to Gemini via `.agent-collab/report.md`.
-2. **Pre-Dispatch Clarification Gate (Gemini -> User)**: Before writing `contract.md`/`task.md` or dispatching, if **any** requirement goal, business rule, edge case, API semantics, visual tradeoff, or target branch is unclear, **NEVER assume defaults**. Ask concise numbered questions (2–3 concrete options + your recommendation per question) and align with the user first.
-3. **Mid-Execution Escalation (Codex -> Gemini -> User)**: `task.md` and `AGENTS.md` require Codex to **stop and NEVER guess or hack** when hitting ambiguity, library/architecture conflicts, or product tradeoffs. Codex writes `Status: BLOCKED_NEED_CLARIFICATION` (blocker, root cause, 2–3 options) to `.agent-collab/report.md` and creates `.agent-collab/done.flag`. Gemini translates the options into plain language for the user, gets a decision, revises the contract/task, and re-dispatches.
-4. **Role & Copy Boundaries**:
-   - **Gemini**: Requirements, `docs/architecture.md`, API contracts, **all frontend UI/CSS/animations/interactions & user-facing copy**, Git branch/commit lifecycle, independent diff review, plain-language reporting.
-   - **Codex Subagent**: Backend APIs, DB schemas/migrations/queries, business logic, scripts, headless pure-logic modules (state machines, parsers, algorithms, utilities), and unit/integration tests.
-   - **Error Codes vs. UI Copy**: Backend returns structured error codes + machine params ONLY; Codex NEVER authors user-facing UI copy.
-5. **User-Owned Model, Effort & Permission Control**:
-   - **New / Reopened / Resumed Session**: Model and reasoning effort MUST always be explicitly chosen by the user from real local models (`start_codex_window.py --list-models`). Never pick on the user's behalf, guess model names, or fall back to `config.toml` defaults.
-   - **Subsequent Dispatches (`codex queue` / fallback `codex exec`)**: **NEVER pass `-m`, `--model`, `-c model=...`, `-c model_reasoning_effort=...`, or `-c service_tier=...` override flags**, so in-place `/model` and `/permissions` changes made inside a visible Codex window stay active.
+- Before writing a contract or dispatching, clarify goals, business rules, edge cases, interfaces, permissions, and the target branch. Give the user 2–3 practical options with a recommendation when a decision is needed. Record the decision in the work order.
+- Choose `AUDIT` for read-only investigation, `SURGICAL_FIX` for a limited fix with a targeted regression test, or `FEATURE_IMPL` for a feature, multi-file refactor, or high-risk change. Handle intuitive configuration or typo edits of up to 10 lines directly when they have no interface or safety effects.
+- For `FEATURE_IMPL`, Gemini first reads or authors the minimum `docs/architecture.md` blueprint and records the interface, data, error, and edge-case decisions in the contract. Obtain the user's agreement on both before dispatch. Use the [architecture](./references/architecture.template.md), [contract](./references/contract.template.md), and [task](./references/task.template.md) templates.
+- `AUDIT` stays on the current branch. Record the HEAD, staged, unstaged, and untracked baseline. Audit a dirty tree in place. Keep the working tree and Git state as found, with `git stash` forbidden.
+- A `SURGICAL_FIX` may target `main` only when the user explicitly approves, the working tree is clean, and the change is confined to a small allowlisted fix and its regression test. Public interfaces, schemas, dependencies, permission boundaries, and multi-module changes require a confirmed `fix/<slug>` branch. Use a confirmed `feat/<slug>` or `fix/<slug>` branch for `FEATURE_IMPL`. Gemini creates or switches to the agreed branch.
+- Record `Git Branch`, `Baseline Commit`, and `Branch Switched` in `task.md`. On the first dispatch after switching, require Codex to reread the target files from disk. Keep Git writes with Gemini. Gemini obtains approval before commits or merges.
+- Before medium or large work, obtain confirmation of the role split, architecture or contract, branch, task mode, and Codex setup. If the target repository uses the optional [AGENTS template](./references/AGENTS.template.md), apply its corresponding task mode.
 
-## 2. Architecture Blueprint & Tiered Git Branch Governance
+## 2. Verify CLI capability and resolve a session
 
-- **Long-Term Blueprint (`docs/architecture.md`)**: Committed to Git and **maintained ONLY by Gemini** (template: [architecture.template.md](./references/architecture.template.md)). Always read `docs/architecture.md` first in a new window to prevent context amnesia. Keep ephemeral `.agent-collab/` files Git-ignored.
-- **Zero Git Mutations by Codex**: Codex is strictly forbidden from running `git checkout`, `git switch`, `git branch`, `git commit`, `git push`, `git reset`, `git rebase`, `git merge`, or `git stash`.
-- **Tiered Branch Strategy (Executed by Gemini)**:
-  - **`AUDIT` & small `SURGICAL_FIX`**: Stay on the current branch. Check `git status --short` first; if uncommitted frontend/unrelated edits exist, stash (`git stash push -m "wip-before-codex"`) or recommend a checkpoint commit before dispatching.
-  - **`FEATURE_IMPL`, multi-file refactors, or high-risk changes**: Confirm a clean working tree, **confirm the branch name with the user first**, then switch to `feat/<slug>` or `fix/<slug>`.
-- **Post-Branch-Switch Mandate**: On the first dispatch after switching branches, record `Git Branch`, `Baseline Commit`, and `Branch Switched: Yes` at the top of `task.md` and explicitly require Codex to **re-read all target files from disk** rather than relying on prior conversation memory.
+On Windows use `where.exe codex`. On Bash or Zsh use `type -a codex`. Check `codex --version` and `codex queue --help` on the selected CLI. Require `queue --resume`, local `-C`, and a daemon that supports queueing if using shared local app-server. For isolated desktops, verify `codex app-server daemon --help` and `codex app-server proxy --help`. Use the same resolved executable and `CODEX_HOME` for the launcher, the session store, and subsequent queue calls.
 
-## 3. Pre-Flight, Session Binding, Desktop-Aware Launch & Resume
+Check that `.agent-collab/` is Git-ignored before creating project collaboration files. Use absolute project paths in commands. When overriding Codex home, pass the same `--codex-home` to the Python entry points and set that `CODEX_HOME` in the shell running Codex.
 
-Before the first dispatch in a session:
-1. Verify Codex CLI (`where.exe codex` / `command -v -a codex` for multi-version conflicts, `codex --version`, `codex queue --help`) and confirm `.agent-collab/` is ignored in `.gitignore` or `.git/info/exclude`.
-2. Resolve the active Codex session **UUID** with [find_codex_thread.py](./scripts/find_codex_thread.py) (**always pass UUID to `codex queue --thread`**, never rely on `/rename` names):
-   ```bash
-   python "<SKILL_DIR>/scripts/find_codex_thread.py" --cwd "<REPO_ROOT>"
-   ```
-   - **`STATUS: CACHED` / `AUTO_SELECTED` / `AUTO_SELECTED_STALE` (`exit 0`)**: If `.agent-collab/session.json` holds a valid live binding for this repo (for `DAEMON_MANAGED`, verified via `thread/loaded/list` — works seamlessly both before and after the first `codex queue` materializes `rollout-*.jsonl`) and the user has NOT asked to reconfigure, **reuse that `THREAD_ID` directly without asking again**.
-   - **`STATUS: DAEMON_SESSION_OFFLINE` / `STATUS: SANDBOX_SESSION_OFFLINE` (`exit 3`) or `STATUS: NOT_FOUND` (`exit 1`)**: **Do NOT proactively ask whether to resume an old session** (and never dispatch to an offline `DAEMON_MANAGED` / `SANDBOX_BACKGROUND` UUID). Proceed directly into the **New-Session Launch Flow** below and ask the user for model & reasoning effort.
-   - **Stale / Closed Visible Window Recovery**: If `codex queue --thread "<UUID>"` reports an invalid/expired session, first rerun `find_codex_thread.py --cwd "<REPO_ROOT>" --refresh`. If an existing active window resolves unambiguously, rebind and retry once; otherwise enter the **New-Session Launch Flow**.
-   - **`STATUS: MULTIPLE_MATCHES` (`exit 2`)**: Present every candidate as **`[编号] <UUID短码> | 模型: <model> (<effort>) | 最近活跃: <last_active> | 首句摘要: <first_user_message>`**, and **ALWAYS** append the fixed option:
-     - `[0] 不复用现有会话，按新指定的模型与思考强度新建一个 Codex 会话`
-     - If the user picks `1`/`2`..., pin with `find_codex_thread.py --cwd "<REPO_ROOT>" --select <UUID>`. If `[0]`, run the **New-Session Launch Flow** (`--force-new`).
+```bash
+python -B "<SKILL_DIR>/scripts/find_codex_thread.py" --cwd "<ABS_PROJECT_ROOT>"
+```
 
-### New-Session Launch Flow ([start_codex_window.py](./scripts/start_codex_window.py))
+- `CACHED` and `AUTO_SELECTED` indicate a verified live binding. Reuse its `THREAD_ID` when the session's effective permissions fit the task and the user has not requested reconfiguration. Daemon bindings use `thread/loaded/list` and `thread/read`. Visible discovery uses a live local rollout writer. A past rollout alone is historical.
+- `MULTIPLE_MATCHES` requires the user's selection. Show UUID short code, model, effort, last activity, and first substantive message. Show whether the list was truncated. Include option `[0] Open and configure a new session`. Pass a chosen live UUID to `--select`. An explicit selection needs proof of project ownership and liveness.
+- `NOT_FOUND`, `HISTORICAL`, `DAEMON_SESSION_OFFLINE`, and `SANDBOX_SESSION_OFFLINE` lead to the new-session flow unless the user explicitly requests historical resume. `--refresh` rechecks the binding and preserves managed ownership and stopped records. `START_PENDING` means a visible launch is waiting for its readiness message. Check the window and refresh.
+- `SESSION_PROBE_FAILED` leaves liveness unknown. Resolve the failure before launching or dispatching. For queue failures, refresh and determine whether the particular delivery was accepted before retrying. A resume warning can accompany queue exit `0`. Inspect stderr as well as the exit code.
 
-Applies whenever `NOT_FOUND`, `DAEMON_SESSION_OFFLINE`, `SANDBOX_SESSION_OFFLINE`, user picks `[0]`, or user asks Gemini to reconfigure (`--force-new`). `start_codex_window.py` automatically detects the Windows desktop:
-- Main desktop (`Default` / macOS / Linux) -> **`VISIBLE_WINDOW`** via `ShellExecuteW` + `wt.exe` (or macOS/Linux terminal).
-- Isolated sandbox desktop (`exebox-*`) -> **`DAEMON_MANAGED`** natively via `codex app-server proxy` JSON-RPC (`thread/start`, `thread/resume`, `thread/loaded/list`, `thread/unsubscribe`), spawning **ZERO** `wt.exe` / `conhost.exe` processes and surviving `run_command` Job Object exits.
+```bash
+python -B "<SKILL_DIR>/scripts/find_codex_thread.py" --cwd "<ABS_PROJECT_ROOT>" --refresh
+python -B "<SKILL_DIR>/scripts/find_codex_thread.py" --cwd "<ABS_PROJECT_ROOT>" --select "<UUID>"
+```
 
-1. **Mandatory User-Specified Model & Effort**:
-   - Both **model** and **reasoning effort** MUST be explicitly specified by the user.
-   - If either is missing, Gemini MUST first probe real local models (also prints detected `DESKTOP`, `launch_mode`, and daemon status; never guess model names):
-     ```bash
-     python "<SKILL_DIR>/scripts/start_codex_window.py" --list-models
-     ```
-   - Ask the user to fill in the missing **model** and **reasoning effort** from the probed list. **NEVER auto-select or fall back to `config.toml` defaults.**
-2. **Present Mode-Aligned Recommended Permissions in the Same Turn**:
-   - In the same message asking for model & reasoning effort, state the recommended safety permissions (used automatically unless the user overrides them):
-     - **`VISIBLE_WINDOW` (main desktop / macOS / Linux)**:
-       - `AUDIT`: `-s read-only`
-       - `SURGICAL_FIX` / `FEATURE_IMPL`: `-s workspace-write -a on-request`
-       - `danger-full-access` or `-a never` ONLY when explicitly requested by the user.
-     - **`DAEMON_MANAGED` (isolated desktop, native managed daemon, non-interactive)**:
-       - `AUDIT`: `-s read-only -a never`
-       - `SURGICAL_FIX` / `FEATURE_IMPL`: `-s workspace-write -a never`
-       - *(Non-interactive `-a never` prevents headless approval deadlocks; safety is enforced by sandbox directory boundaries plus mandatory post-completion `git diff` review. `danger-full-access` STILL requires explicit user request.)*
-3. **Launch & Auto-Bind UUID**:
-   ```bash
-   python "<SKILL_DIR>/scripts/start_codex_window.py" --cwd "<REPO_ROOT>" --model "<MODEL>" --effort "<EFFORT>" --sandbox "<SANDBOX>" [--approval "<APPROVAL>"] [--force-new] --timeout 25
-   ```
-   - `STATUS: STARTED_AND_BOUND` (`exit 0`): Session created and bound in `.agent-collab/session.json` (`mode: DAEMON_MANAGED` or `VISIBLE_WINDOW`). In `DAEMON_MANAGED` mode, `thread/start` returns the UUID immediately and `rollout-*.jsonl` materializes on disk when the first `codex queue` message is sent; `find_codex_thread.py` verifies liveness via `thread/loaded/list`.
-   - `STATUS: DAEMON_UNAVAILABLE` (`exit 1`): Local managed daemon was not running and did not persist across cold-start (often reclaimed by a sandbox Job Object). Ask the user to run `codex app-server daemon start` once in a normal main-desktop terminal, then retry.
-   - `STATUS: START_TIMEOUT` (`exit 124`): In `VISIBLE_WINDOW`, remind the user to check the opened window for a directory trust prompt, then rerun `find_codex_thread.py --cwd "<REPO_ROOT>" --refresh`.
+## 3. Start, resume, or stop
 
-### On-Demand Historical Session Resume (User-Requested Only)
+For a new or resumed session, require the user's explicit model and reasoning effort. Probe the local catalog when either choice is missing. The output identifies `models_cache.json` as its source. Default output excludes hidden models. Use `--include-hidden` explicitly and `--limit` to cap the listed models. A missing catalog requires the user to verify model availability.
 
-**ONLY** when the user explicitly requests to continue/resume a previous session ("继续/恢复上次会话", "resume previous session"):
-1. List historical sessions for this project:
-   ```bash
-   python "<SKILL_DIR>/scripts/find_codex_thread.py" --cwd "<REPO_ROOT>" --list-history
-   ```
-2. Show numbered candidates (`UUID短码 + 模型 + 推理强度 + 最近活跃时间 + 首条真实用户消息`), ask the user to choose one and confirm model & reasoning effort (running `--list-models` if incomplete), with mode-aligned recommended permissions.
-3. Resume and bind (in `DAEMON_MANAGED`, invokes `thread/resume` with `excludeTurns: true` to keep the RPC payload compact while preserving full thread history and applying the chosen model/effort/sandbox/approval; in `VISIBLE_WINDOW`, opens `codex resume` and confirms live process):
-   ```bash
-   python "<SKILL_DIR>/scripts/start_codex_window.py" --cwd "<REPO_ROOT>" --resume "<UUID>" --model "<MODEL>" --effort "<EFFORT>" --sandbox "<SANDBOX>" [--approval "<APPROVAL>"] --timeout 25
-   ```
+```bash
+python -B "<SKILL_DIR>/scripts/start_codex_window.py" --list-models
+```
 
-### Mid-Session Switching & Safe Session Cleanup
+| Task mode | Windows Default, macOS, Linux | Windows isolated `exebox-*` |
+|---|---|---|
+| `AUDIT` | `--sandbox read-only` | `--sandbox read-only --approval never` |
+| `SURGICAL_FIX` or `FEATURE_IMPL` | `--sandbox workspace-write --approval on-request` | `--sandbox workspace-write --approval never` |
 
-- **Mode 1 — In-Place Switch (Visible Window)**: User types `/model` or `/permissions` directly in the Codex window; `codex queue --thread "<UUID>"` never passes override flags, so changes persist with full context.
-- **Mode 2 — Reconfigure via Gemini (`--force-new`)**: Confirm explicit model & effort, then run `start_codex_window.py ... --force-new`. If the old session is `DAEMON_MANAGED`, the script gracefully unsubscribes ONLY that old thread via `thread/unsubscribe` (never stopping the shared daemon or killing OS processes); if legacy `SANDBOX_BACKGROUND`, verifies PID fingerprint; if `VISIBLE_WINDOW`, leaves it idle for the user to close manually (**never force-kill visible windows**).
-- **Explicit Stop (`--stop`)**: To shut down this project's managed Codex thread cleanly (`turn/interrupt` + `thread/unsubscribe` in `DAEMON_MANAGED`, zero `taskkill`, shared daemon untouched):
-  ```bash
-  python "<SKILL_DIR>/scripts/start_codex_window.py" --cwd "<REPO_ROOT>" --stop
-  ```
+Permissions are part of the user's decision. Require explicit authorization for `danger-full-access` or for `never` on a visible session. Use a verified `read-only` session for `AUDIT` and reconfigure or use an authorized read-only fallback if the current session has writable permissions. A failed or unsupported Windows desktop probe returns `DESKTOP_UNAVAILABLE`.
 
-## 4. Dispatch Threshold, 3 Task Modes & Automated Wait
+**Visible Windows Default, macOS, and Linux**
 
-- **`<= 10` lines** of intuitive config/typo tweak: Gemini edits directly — do NOT dispatch.
-- **Medium/large tasks**: Complete the Clarification Gate first, then present a 3–5 line confirmation (role split, contract summary, branch, task `Mode`, and Codex session status/config) and get user approval.
-- Write `.agent-collab/contract.md` ([contract.template.md](./references/contract.template.md)) and `.agent-collab/task.md` ([task.template.md](./references/task.template.md)) with an explicit **`Mode`**:
-  - `AUDIT`: Pure read-only investigation (`report.md` + `done.flag` only).
-  - `SURGICAL_FIX`: Minimal allowlisted diff + regression test (no drive-by refactors).
-  - `FEATURE_IMPL`: Feature branch + architecture contract + full test coverage.
-- *(Optional, once per repo)* Offer [AGENTS.template.md](./references/AGENTS.template.md) as root `AGENTS.md`.
+```bash
+python -B "<SKILL_DIR>/scripts/start_codex_window.py" --cwd "<ABS_PROJECT_ROOT>" --model "<MODEL>" --effort "<EFFORT>" --sandbox "<SANDBOX>" --timeout 25
+```
 
-### Pre-Clean, Queue & Auto-Poll Sequence
+For visible writing tasks, also pass `--approval on-request`. Launcher success is confirmed by a unique readiness message in the target rollout. If multiple uncorrelated new sessions appear, ask the user to select one. Confirm directory trust or login prompts in the visible window when necessary, then run discovery with `--refresh`.
 
-1. **Clean stale signals** before queuing:
-   ```bash
-   python "<SKILL_DIR>/scripts/wait_codex_done.py" --clean --path .agent-collab/done.flag
-   ```
-2. **Dispatch via `codex queue`** (UUID only; **ZERO** `-m`/`--model`/reasoning/speed flags; require `report.md` FIRST, `done.flag` LAST):
-   ```bash
-   codex queue --thread "<UUID>" --resume -C "<REPO_ROOT>" --message "Read docs/architecture.md (if present), .agent-collab/contract.md, and .agent-collab/task.md (Mode: <MODE>, Round 1/3). Follow Allowed/Forbidden Paths strictly. If branch switched, re-read target files from disk. If blocked by ambiguity or product tradeoffs, stop high-risk edits and write Status: BLOCKED_NEED_CLARIFICATION with 2-3 options in .agent-collab/report.md. Never run git write commands or leave background processes. Write complete .agent-collab/report.md FIRST, then create empty .agent-collab/done.flag LAST."
-   ```
-   *(In `DAEMON_MANAGED` mode, `--resume` delivers directly to the loaded daemon thread while preserving the thread's configured model, reasoning effort, sandbox, and approval policy; in `VISIBLE_WINDOW`, omit `--resume` if the window is already actively attached.)*
-3. **Auto-wait for completion** with [wait_codex_done.py](./scripts/wait_codex_done.py) (no manual "验收" prompt required):
-   ```bash
-   python "<SKILL_DIR>/scripts/wait_codex_done.py" --path .agent-collab/done.flag --timeout 600 --interval 3
-   ```
-   - `CODEX_DONE` (`exit 0`, `done.flag` auto-deleted): Read `.agent-collab/report.md` immediately. If `Status: BLOCKED_NEED_CLARIFICATION`, present clear plain-language options to the user; otherwise proceed directly into Section 5 Acceptance Review.
-   - `CODEX_TIMEOUT` (`exit 124`): Notify the user to inspect the Codex window (or verify `DAEMON_MANAGED` loaded status via `find_codex_thread.py` if headless).
-4. *(Optional fallback ONLY if no interactive/background Codex session exists and user explicitly approves)*:
-   `codex exec --sandbox workspace-write -C "<REPO_ROOT>" "..."` — still NEVER pass model/reasoning/speed overrides.
+**Isolated Windows desktop**
 
-## 5. Mode-Aligned Independent Diff Review & 3-Round Circuit Breaker
+Prepare the work order and the first `TASK_MESSAGE` from section 4 before launching. Use `--dispatch-message` on the same RPC connection as `thread/start` so startup does not depend on a fresh idle thread remaining loaded until another CLI invocation.
 
-Treat `.agent-collab/report.md` as a claim, never ground truth. Execute in exact order:
-1. Read `.agent-collab/report.md`.
-2. Inspect Git footprint: `git status --short`, `git diff --stat`, `git diff -- . ":(exclude)*lock*" ":(exclude)*.snap" ":(exclude)*.snapshot"`, and **individually read EVERY untracked (`??`) new source file**.
-3. Apply **Mode-Aligned Verification**:
-   - **`AUDIT`**: Confirm **zero source modifications** in `git status` and verify every claim has real `file:line` evidence.
-   - **`SURGICAL_FIX`**: Confirm strict `Allowed Paths` minimal diff (zero unrelated refactoring), no UI copy/anti-gaming shortcuts, and personally run regression tests (`exit 0`).
-   - **`FEATURE_IMPL`**: Confirm alignment with `docs/architecture.md` & `.agent-collab/contract.md`, audit every `??` new source file, reject `any`/`@ts-ignore`/`.skip`/deleted assertions/UI copy leaks/unauthorized deps or `.env` edits, and personally run full typecheck/build/tests (`exit 0`).
-4. **Verdict & Circuit Breaker**:
-   - **PASS**: Report verified results in plain language; update `docs/architecture.md` if architecture evolved; ask before committing/merging (never auto-commit).
-   - **FAIL (Rounds 1–2)**: Clean stale `report.md`/`done.flag`, increment Round in `task.md`, queue surgical `file:line` fixes via `codex queue --thread "<UUID>"`, and re-run `wait_codex_done.py`.
-   - **CIRCUIT BREAKER (Round 3 Fails or Repeated Scope/Git Violation)**: Halt dispatching immediately and present a structured postmortem + concrete recovery options to the user.
+```bash
+python -B "<SKILL_DIR>/scripts/start_codex_window.py" --cwd "<ABS_PROJECT_ROOT>" --model "<MODEL>" --effort "<EFFORT>" --sandbox "<SANDBOX>" --approval never --dispatch-message "<TASK_MESSAGE>" --timeout 25
+```
+
+`STARTED_AND_BOUND` or `RESUMED_AND_BOUND` with `DISPATCH_STATE: started` and `TURN_ID` confirms that the daemon accepted and started this delivery. Use that turn ID in transcript wait. `ALREADY_BOUND` keeps an existing binding and leaves this invocation's message unsent. `CONFIG_MISMATCH` stops before dispatch when the returned model, effort, sandbox, or approval is different. `DISPATCH_UNKNOWN` requires checking the rollout or queue before any retry. Treat `DAEMON_UNAVAILABLE` as a startup failure and use its diagnostic to resolve the CLI or daemon prerequisite.
+
+**Historical resume and cleanup**
+
+List history only when the user asks to continue a saved conversation. Show numbered entries and any truncation. Confirm the UUID, model, effort, and sandbox before resuming.
+
+```bash
+python -B "<SKILL_DIR>/scripts/find_codex_thread.py" --cwd "<ABS_PROJECT_ROOT>" --list-history
+python -B "<SKILL_DIR>/scripts/start_codex_window.py" --cwd "<ABS_PROJECT_ROOT>" --resume "<UUID>" --model "<MODEL>" --effort "<EFFORT>" --sandbox "<SANDBOX>" --timeout 25
+python -B "<SKILL_DIR>/scripts/start_codex_window.py" --cwd "<ABS_PROJECT_ROOT>" --resume "<UUID>" --model "<MODEL>" --effort "<EFFORT>" --sandbox "<SANDBOX>" --approval never --dispatch-message "<TASK_MESSAGE>" --timeout 25
+```
+
+The first resume command targets a visible window. Append `--approval on-request` for an authorized visible writing task. The second resume command targets the daemon and sends the delivery in the same connection using `excludeTurns: true` on `thread/resume`. Both paths validate UUID ownership. Use `--force-new` only for a user-authorized replacement, including an explicit replacement before a resume. Visible windows remain under user control. For a live managed binding, replacement stops if safe cleanup fails.
+
+```bash
+python -B "<SKILL_DIR>/scripts/start_codex_window.py" --cwd "<ABS_PROJECT_ROOT>" --stop
+```
+
+In daemon mode, read `TURN_STATUS` and `UNSUBSCRIBE_STATUS` separately. `STOPPED` confirms the project binding is marked stopped after the turn is verified idle or terminal. `notSubscribed` applies only to the current proxy. `SKIPPED_VISIBLE_WINDOW` directs the user to close the window. A legacy background PID requires project UUID ownership and a matching Windows process fingerprint. A legacy PID-only record lacks the evidence required for automatic termination. `--dry-run` is for start or resume planning. Combining it with `--stop` returns `INVALID_ARGUMENTS`.
+
+## 4. Dispatch and wait
+
+Use one delivery ID and one acceptance round for each dispatch. Pass the complete task message as one argument. Start it with the exact marker and include the mode, authorized scope, verification, project branch, and expected result. Use a fresh delivery ID when sending a clarification follow-up in the same round.
+
+```text
+[orchestrator-task:TASK-001-a1 round:1]
+Read the project architecture and the agreed work order or the inline scope below. Follow the allowed paths and verification requirements. Report the exact blocker and options if a user decision is needed.
+```
+
+For `AUDIT`, use the same structured result in Codex's final reply, with `Status`, `Task ID`, and `Round` in the first 20 lines. Use `Status: READY_FOR_REVIEW` or `Status: BLOCKED_NEED_CLARIFICATION`. Codex reads only and does not create report or flag files. Gemini may record the reply if authorized. When the entire project must stay write-free, use an inline work order and an already verified read-only binding or the approved stdout fallback.
+
+For writing tasks, have Codex write `report.md` under `.agent-collab/results/<TASK_ID>/<ROUND>/` following the [task template](./references/task.template.md). The report starts with the same three fields. When it is complete, atomically publish its sibling `done.flag` containing JSON with the current `task_id` string and `round` integer. Gemini prepares the directory and checks cleanup before dispatch.
+
+```bash
+python -B "<SKILL_DIR>/scripts/wait_codex_done.py" --cwd "<ABS_PROJECT_ROOT>" --clean --task-id "<TASK_ID>" --round <ROUND>
+```
+
+Use this full queue command for rounds 1, 2, and 3 on an already verified live binding when the launcher has not sent this delivery. Set the marker and reporting fields to the active delivery ID and round. Respect in-place `/model` or `/permissions` changes in visible windows. Keep model, effort, and service-tier override flags out of queue calls.
+
+```bash
+codex queue --thread "<UUID>" --resume -C "<ABS_PROJECT_ROOT>" --message "<TASK_MESSAGE>"
+```
+
+Use the first command for writing tasks. Use the second for a queued `AUDIT`, or append `--turn-id "<TURN_ID>"` when the daemon launcher returned one. Transcript wait only reads the project-owned rollout. It tolerates lazy creation and waits for the matching turn to finish before extracting its final reply.
+
+```bash
+python -B "<SKILL_DIR>/scripts/wait_codex_done.py" --cwd "<ABS_PROJECT_ROOT>" --task-id "<TASK_ID>" --round <ROUND> --timeout 600 --interval 3
+python -B "<SKILL_DIR>/scripts/wait_codex_done.py" --cwd "<ABS_PROJECT_ROOT>" --mode transcript --thread "<UUID>" --task-id "<TASK_ID>" --round <ROUND> --timeout 600 --interval 3 --json
+```
+
+`CODEX_DONE` with `REPORT_STATUS`/`report_status` is the completion signal. In flag mode, the waiter checks the report and flag against both identifiers before consuming the flag. `--keep-flag` preserves it after verification. `--task-id` is mandatory when waiting. `--round` defaults to `1`. `--path` and `--report` are flag-mode overrides resolved relative to `--cwd` unless absolute. `--clean` without a task ID targets the legacy default flag and report. A failed cleanup blocks dispatch. On timeouts or an unknown turn state, verify delivery before proceeding.
+
+When there is no suitable session and the user explicitly approves standalone execution, use stdout and the same mode-aligned sandbox. Use `read-only` for `AUDIT` and `workspace-write` for authorized writing tasks. Keep model, effort, and service-tier override flags out of this fallback.
+
+```bash
+codex exec -s "<SANDBOX>" -C "<ABS_PROJECT_ROOT>" "<TASK_MESSAGE>"
+```
+
+## 5. Review, clarify, and apply the three-round limit
+
+- For `BLOCKED_NEED_CLARIFICATION`, suspend the affected edits. Codex reports the blocker, evidence, and 2–3 viable options in the result channel for its mode. Gemini presents them to the user and waits for a decision. Update the contract and use a fresh delivery ID at the same acceptance round. A clarification by itself does not consume a review round.
+- Independently verify reported evidence. Review the full footprint first, including staged, unstaged, and untracked files. Compare against the recorded baseline and account for prior dirty changes without moving or reverting them.
+
+```bash
+git --no-optional-locks status --short --untracked-files=all
+git diff --cached "<BASELINE_COMMIT>" --
+git diff --
+git diff "<BASELINE_COMMIT>" --
+git ls-files --others --exclude-standard
+```
+
+After examining all changed paths, a focused diff may omit these exact lockfile names. Still review lockfiles changed outside the work order.
+
+```bash
+git diff "<BASELINE_COMMIT>" -- . ":(exclude,glob)**/package-lock.json" ":(exclude,glob)**/pnpm-lock.yaml" ":(exclude,glob)**/yarn.lock" ":(exclude,glob)**/poetry.lock" ":(exclude,glob)**/Cargo.lock"
+```
+
+- For `AUDIT`, confirm the project has no audit-induced edits and verify the cited evidence. For `SURGICAL_FIX`, re-run the targeted regression and check the allowlist. For `FEATURE_IMPL`, verify the architecture and interface contract, inspect new files, and re-run the required build, typecheck, and tests. Check for weakened assertions, suppressed type errors, changes to dependencies or secrets, and UI copy outside the agreed scope.
+- On `PASS`, report verified results and obtain approval before any commit or merge. On `FAIL` in rounds 1 or 2, increment the round once and dispatch precise file-and-line corrections through the same sequence in section 4. Pause on a scope or Git violation and escalate. If acceptance fails in round 3, halt dispatch and present the failed criteria and recovery options. Get a new user decision before any further work.
+
+## CLI result contract
+
+Check both the reported status and the exit code. Python examples accept `--json` for structured status. Help exits `0`. Argument parser errors exit `2` with usage text. `codex_daemon_rpc.py` is an imported transport and has no public command.
+
+| Entry point | Exit | Status values |
+|---|---:|---|
+| `find_codex_thread.py` | 0 | `CACHED`, `AUTO_SELECTED`, `SELECTED`, `HISTORY_LISTED` |
+| | 1 | `NOT_FOUND`, `SESSION_PROBE_FAILED` |
+| | 2 | `MULTIPLE_MATCHES`, `INVALID_ARGUMENTS`, `INVALID_SESSION` |
+| | 3 | `DAEMON_SESSION_OFFLINE`, `SANDBOX_SESSION_OFFLINE`, `HISTORICAL`, `START_PENDING` |
+| `start_codex_window.py` | 0 | `MODELS_LISTED`, `DRY_RUN`, `STARTED_AND_BOUND`, `RESUMED_AND_BOUND`, `ALREADY_BOUND`, `STOPPED`, `ALREADY_EXITED`, `NO_ACTIVE_SESSION`, `SKIPPED_VISIBLE_WINDOW` |
+| | 1 | `NO_MODELS_CACHE`, `DESKTOP_UNAVAILABLE`, `DAEMON_UNAVAILABLE`, `DAEMON_RPC_ERROR`, `SESSION_PROBE_FAILED`, `CONFIG_MISMATCH`, `BINDING_CONFLICT`, `DISPATCH_UNKNOWN`, `STOP_FAILED`, `LAUNCH_FAILED`, `OPERATION_FAILED` |
+| | 2 | `INVALID_ARGUMENTS`, `INVALID_SESSION`, `MULTIPLE_MATCHES` |
+| | 3 | `START_PENDING` |
+| | 124 | `START_TIMEOUT`, `RESUME_TIMEOUT` |
+| `wait_codex_done.py` | 0 | `CLEANED`, `CODEX_DONE` |
+| | 1 | `CLEAN_FAILED`, `WAIT_FAILED`, `TURN_FAILED`, `INVALID_REPORT` |
+| | 2 | `INVALID_ARGUMENTS`, `INVALID_SESSION` |
+| | 124 | `CODEX_TIMEOUT` |
+| | 130 | `CODEX_INTERRUPTED` |
+
+The launcher's internal visible-readiness probe uses `BOOTSTRAP_READY`/`0`, `MULTIPLE_MATCHES`/`2`, and `BOOTSTRAP_PENDING`/`3`. Public discovery lists at most 5 candidates or 10 history entries by default. `--limit` changes the cap and the output reports the total and truncation. Use `--timeout` for the total operation budget. See each script's `--help` for optional store and display overrides.

@@ -5,14 +5,14 @@
 ## 1. Feature & Alignment
 
 - **Feature / Issue Name**: `<short title>`
-- **Architecture Blueprint**: `docs/architecture.md` *(read first if present)*
+- **Architecture Blueprint**: `docs/architecture.md` (required and user-confirmed before `FEATURE_IMPL` dispatch)
 - **Target Git Branch**: `<current branch or confirmed feat/<slug> / fix/<slug>>`
 - **Problem Statement**: `<1-3 sentences describing the agreed goal>`
 - **Out of Scope**: `<explicit non-goals to prevent scope creep>`
 
 ## 2. Clarified User Decisions (Ask-Don't-Guess Log)
 
-> Record every product/edge-case decision confirmed with the user before dispatch so Codex never guesses.
+> Record the user-confirmed architecture and interface decisions before dispatching `FEATURE_IMPL`. Update the contract after clarification and link the follow-up delivery to the same acceptance round.
 
 1. `<Decision 1 — e.g. Duplicate submissions return ERR_CONFLICT (409) instead of silently upserting>`
 2. `<Decision 2 — e.g. Pagination defaults to limit=20, max=100>`
@@ -67,3 +67,4 @@
 - [ ] All changes stay strictly within `Allowed Paths` for the declared task `Mode`.
 - [ ] Tests cover happy paths, clarified edge cases, and regressions without weakened assertions or type escapes.
 - [ ] All one-shot verification commands exit with code `0` when independently re-run by Gemini.
+- [ ] An `AUDIT` delivers the structured evidence as its final reply and keeps the project write-free. Writing modes publish the task-bound report and flag specified in the work order.

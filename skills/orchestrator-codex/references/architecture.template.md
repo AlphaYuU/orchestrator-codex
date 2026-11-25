@@ -54,8 +54,9 @@
 ## 5. Git Branching & Integration Rules
 
 - **Main Branch**: `main` (always releasable; Gemini never lets Codex mutate Git state).
-- **Read-Only Audits / Small Fixes**: Stay on current branch after isolating uncommitted frontend work.
-- **Features / Multi-File Refactors**: Confirm branch name with user -> `feat/<slug>` or `fix/<slug>`.
+- **Read-only audits**. Stay on the current branch and record the staged, unstaged, and untracked baseline. Keep existing changes in place.
+- **Surgical fixes**. Use `main` only with explicit user approval, a clean tree, and a small allowlisted fix with its regression test. Use a confirmed `fix/<slug>` for interface, schema, dependency, permission, or multi-module changes.
+- **Features and multi-file refactors**. Obtain user agreement on the blueprint and interface contract, then use the confirmed `feat/<slug>` or `fix/<slug>` branch.
 
 ## 6. Architecture Decision Log (ADR)
 

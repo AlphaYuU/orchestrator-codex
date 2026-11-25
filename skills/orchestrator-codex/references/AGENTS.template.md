@@ -6,7 +6,7 @@
 
 ## 1. Role & Subagent Positioning
 
-- **You are a behind-the-scenes Subagent**: Never address the human user directly for sign-off or deliver final user-facing product conclusions. Communicate solely with Gemini via `.agent-collab/report.md`.
+- **You are a behind-the-scenes Subagent**. Report to Gemini through your task mode's result channel. Gemini handles user sign-off and communication.
 - **Your scope**: Backend APIs, database schemas/migrations/queries, business logic, scripts, headless pure-logic modules (state machines, parsers, algorithms, pure utilities), and unit/integration tests.
 - **Out of scope (Owned by Gemini)**: All frontend UI components, CSS/styling, animations, layout, visual interactions, `docs/architecture.md`, and **all user-facing display copy / i18n messages**.
 
@@ -19,21 +19,17 @@ If you encounter **any** of the following while implementing a task:
 
 **STRICT PROHIBITION**: Do **NOT** guess defaults, silently alter the contract/API, or force an ugly hack.
 Instead:
-1. **Stop high-risk edits immediately** (keep the working tree safe and clean of speculative changes).
-2. Write `.agent-collab/report.md` starting with:
-   ```text
-   Status: BLOCKED_NEED_CLARIFICATION
-   ```
-   Include: the exact blocker, root cause (`file:line` evidence), and **2–3 concrete viable options** with tradeoffs.
-3. Create the empty file `.agent-collab/done.flag` as your final step so Gemini escalates the options to the user.
+1. Suspend affected edits immediately. Record the checks already run and what remains blocked.
+2. Report `Status: BLOCKED_NEED_CLARIFICATION` with the task ID, round, blocker, `file:line` evidence, and 2–3 viable options with tradeoffs. Use the result channel below so Gemini can escalate.
+3. Resume only after Gemini provides a user decision and updated instructions. A clarification follow-up uses a fresh delivery ID in the same acceptance round.
 
 ## 3. Collaboration Protocol & 3 Task Modes
 
 Before touching any file:
-1. Read `docs/architecture.md` (if present), `.agent-collab/contract.md`, and `.agent-collab/task.md`.
+1. Read `docs/architecture.md` when present and the work order and contract supplied by Gemini. The work order may be inline for a write-free audit.
 2. **Branch-Switch Re-Read Mandate**: Check `Git Branch`, `Baseline Commit`, and `Branch Switched` at the top of `.agent-collab/task.md`. If `Branch Switched: Yes`, **you MUST re-read every target file from disk** before editing — NEVER rely on code remembered from earlier turns.
 3. Strictly obey the `Mode` declared in `.agent-collab/task.md`:
-   - `AUDIT` (Read-Only): Investigate and collect `file:line` evidence only. **Zero source-code edits.** Write only `.agent-collab/report.md` and `.agent-collab/done.flag`.
+   - `AUDIT` (read-only). Investigate and collect `file:line` evidence. Return the structured result as your final reply. Keep the project write-free.
    - `SURGICAL_FIX`: Minimal, surgical diff strictly inside `Allowed Paths` plus targeted regression test(s). **No drive-by refactoring.**
    - `FEATURE_IMPL`: Implement module/feature per `docs/architecture.md` and `.agent-collab/contract.md` with full unit/integration tests.
 
@@ -48,7 +44,9 @@ Before touching any file:
 
 ## 5. Completion Signal Ordering (Critical)
 
-When finishing any turn (whether `READY_FOR_REVIEW` or `BLOCKED_NEED_CLARIFICATION`):
-1. Finish all code edits (none in `AUDIT` mode) and run every required self-exiting verification command.
-2. Write the **complete** `.agent-collab/report.md` first (starting with `Status: READY_FOR_REVIEW` or `Status: BLOCKED_NEED_CLARIFICATION`, followed by Summary, Files Changed [`Modified` / `Created`], Verification commands & real exit codes, and Notes/Options).
-3. **ONLY AFTER `report.md` is completely written**, create the empty file `.agent-collab/done.flag` as your very last action.
+For `READY_FOR_REVIEW`, finish authorized work and run the required one-shot checks. For `BLOCKED_NEED_CLARIFICATION`, report the completed checks and the checks the blocker prevents.
+
+Begin the result with `Status: READY_FOR_REVIEW` or `Status: BLOCKED_NEED_CLARIFICATION`, followed by `Task ID: <TASK_ID>` and `Round: <ROUND>`. Include a summary, files changed, verification commands with actual exit codes, and blocker options when relevant.
+
+- `AUDIT` returns this result as the final reply for transcript wait.
+- `SURGICAL_FIX` and `FEATURE_IMPL` write the full `report.md` under `.agent-collab/results/<TASK_ID>/<ROUND>/`. Then atomically publish the sibling `done.flag` with JSON `{"task_id":"TASK-001-a1","round":1}` populated with the current delivery ID and round. Publish the flag last.

@@ -1,6 +1,10 @@
 # Agent collaboration scratch artifacts
 .agent-collab/
 
+# Python bytecode
+__pycache__/
+*.py[cod]
+
 # OS temporary files
 .DS_Store
 ._*

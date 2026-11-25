@@ -16,7 +16,7 @@ A dual-window Agent Skill where **Antigravity (Gemini)** serves as orchestrator 
 
 ## 安装 / Installation
 
-环境要求 / Prerequisites: **Antigravity**, **Codex CLI** (`codex queue`), **Python 3.8+**, **Git**.
+环境要求 / Prerequisites: **Antigravity**, **Codex CLI** (`codex queue --resume`；隔离桌面还需 `app-server daemon/proxy` / isolated desktops also require `app-server daemon/proxy`), **Python 3.8+**, **Git**.
 
 **macOS / Linux:**
 
@@ -31,9 +31,27 @@ ln -s ~/orchestrator-codex/skills/orchestrator-codex ~/.gemini/config/skills/orc
 ```powershell
 git clone https://github.com/AlphaYuU/orchestrator-codex.git D:\Project\Skill\orchestrator-codex
 New-Item -ItemType Directory -Force "$HOME\.gemini\config" | Out-Null
-# If skills.json already exists, merge the path entry into "entries"
-$json = '{"entries":[{"path":"D:\\Project\\Skill\\orchestrator-codex\\skills"}]}'
-[System.IO.File]::WriteAllText("$HOME\.gemini\config\skills.json", "$json`n", (New-Object System.Text.UTF8Encoding($false)))
+$registry = "$HOME\.gemini\config\skills.json"
+$skillPath = 'D:\Project\Skill\orchestrator-codex\skills'
+$registryData = [pscustomobject]@{}
+if (Test-Path -LiteralPath $registry) {
+    $registryText = Get-Content -LiteralPath $registry -Raw -Encoding UTF8 -ErrorAction Stop
+    if (-not $registryText -or -not $registryText.TrimStart().StartsWith('{')) {
+        throw 'skills.json must contain a JSON object.'
+    }
+    $registryData = ConvertFrom-Json -InputObject $registryText -ErrorAction Stop
+}
+if (-not $registryData.PSObject.Properties['entries']) {
+    $registryData | Add-Member -NotePropertyName entries -NotePropertyValue @()
+}
+$registered = @($registryData.entries | Where-Object {
+    $_.path -is [string] -and $_.path.Replace('/', '\').TrimEnd('\') -ieq $skillPath
+}).Count -gt 0
+if (-not $registered) {
+    $registryData.entries = @($registryData.entries | Where-Object { $null -ne $_ }) + [pscustomobject]@{ path = $skillPath }
+}
+$json = $registryData | ConvertTo-Json -Depth 100
+[System.IO.File]::WriteAllText($registry, "$json`n", (New-Object System.Text.UTF8Encoding($false)))
 ```
 
 > Windows 请使用 UTF-8 无 BOM 编码的 `~/.gemini/config/skills.json` 注册（跳过 NTFS Junction / 勿用 `mklink /J`），安装后可在 `/skills` 或 **Customizations → Installed** 确认。  

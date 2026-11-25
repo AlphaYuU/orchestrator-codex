@@ -1,13 +1,5 @@
 #!/usr/bin/env python3
-"""Zero-dependency RFC 6455 WebSocket + JSON-RPC 2.0 client for Codex's local
-managed app-server daemon (`codex app-server proxy` / `codex app-server daemon`).
-
-Used by `start_codex_window.py` and `find_codex_thread.py` in `DAEMON_MANAGED`
-mode on isolated sandbox desktops so threads survive `run_command` exits without
-spawning `wt.exe` or `conhost.exe` and without any PID-killing heuristics.
-
-Zero third-party dependencies. Compatible with Python 3.8+ on Windows, macOS, and Linux.
-"""
+"""Bounded WebSocket and JSON-RPC client for a private Codex app-server proxy."""
 
 from __future__ import annotations
 
@@ -20,638 +12,616 @@ import struct
 import subprocess
 import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
-MODE_DAEMON_MANAGED = "DAEMON_MANAGED"
+from codex_session import CodexCLI, Deadline, canonical_uuid, same_project
 
-_WS_MAGIC_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-_OP_CONT = 0x0
-_OP_TEXT = 0x1
-_OP_BINARY = 0x2
-_OP_CLOSE = 0x8
-_OP_PING = 0x9
-_OP_PONG = 0xA
+
+_WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+_CONT, _TEXT, _BINARY, _CLOSE, _PING, _PONG = 0, 1, 2, 8, 9, 10
+_MAX_FRAME = 8 * 1024 * 1024
+_MAX_MESSAGE = 16 * 1024 * 1024
+_MAX_HEADERS = 64 * 1024
+_MAX_PAGES = 20
+_CLOSE_TIMEOUT = 0.25
 
 
 class DaemonRPCError(RuntimeError):
-    """Raised when communicating with the Codex app-server daemon fails."""
+    """Communication or app-server protocol failure."""
 
 
 class DaemonUnavailableError(DaemonRPCError):
-    """Raised when the local managed Codex daemon is not running and cannot persist."""
+    """The configured CLI could not start a durable local daemon."""
 
-    def __init__(self, message: str, hint: str = "") -> None:
+
+class DaemonProbeError(DaemonRPCError):
+    """Daemon state could not be established."""
+
+
+class ThreadOwnershipError(DaemonRPCError):
+    """The given UUID could not be verified as belonging to this project."""
+
+
+class WebSocketError(DaemonRPCError):
+    def __init__(self, message: str, close_code: int = 1002) -> None:
         super().__init__(message)
-        self.hint = hint
+        self.close_code = close_code
 
 
-def _parse_json_object(raw: str) -> Optional[Dict[str, Any]]:
-    text = (raw or "").strip()
-    if not text:
-        return None
+def _no_window() -> Dict[str, Any]:
+    return {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+
+
+def _spawn_proxy(cli: CodexCLI, args: List[str], **pipes: Any) -> Any:
+    command, env = cli.invocation(args)
+    kwargs = _no_window()
+    if not cli.uses_cmd:
+        return subprocess.Popen(command, env=env, **pipes, **kwargs)
+
+    # A batch shim can spawn Node and the native CLI. Keep the private proxy's
+    # entire subtree in a kill-on-close job, assigning it before any code runs.
+    from codex_windows import start_in_job
+
+    return start_in_job(command, env=env, **pipes, **kwargs)
+
+
+def _terminate_proxy(proc: Any) -> None:
     try:
-        data = json.loads(text)
-        if isinstance(data, dict):
-            return data
-    except json.JSONDecodeError:
+        if proc.poll() is None:
+            proc.terminate()
+    except OSError:
         pass
-    # Handle leading/trailing warnings before/after JSON line
-    for line in reversed(text.splitlines()):
-        s = line.strip()
-        if s.startswith("{") and s.endswith("}"):
-            try:
-                data = json.loads(s)
-                if isinstance(data, dict):
-                    return data
-            except json.JSONDecodeError:
-                continue
-    return None
-
-
-def _no_window_kwargs() -> Dict[str, Any]:
-    if os.name == "nt":
-        return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
-    return {}
-
-
-def get_daemon_status(timeout: float = 5.0) -> Dict[str, Any]:
-    """Query `codex app-server daemon version` in a fresh subprocess."""
+    finally:
+        close_job = getattr(proc, "close_job", None)
+        if close_job is not None:
+            close_job()
     try:
-        proc = subprocess.run(
-            ["codex", "app-server", "daemon", "version"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=max(1.0, timeout),
-            check=False,
-            **_no_window_kwargs(),
-        )
-    except FileNotFoundError:
-        return {
-            "running": False,
-            "status": "cli_not_found",
-            "error": "codex CLI executable was not found in PATH.",
-        }
+        proc.wait(timeout=0.75)
     except subprocess.TimeoutExpired:
-        return {
-            "running": False,
-            "status": "timeout",
-            "error": f"`codex app-server daemon version` timed out after {timeout:g}s.",
-        }
-    except OSError as exc:
-        return {
-            "running": False,
-            "status": "os_error",
-            "error": str(exc),
-        }
+        proc.kill()
+        proc.wait(timeout=0.75)
 
-    parsed = _parse_json_object(proc.stdout)
-    if parsed is None:
-        err_text = (proc.stderr or proc.stdout).strip()
-        unsupported = "unrecognized subcommand" in err_text.lower()
-        return {
-            "running": False,
-            "status": "unsupported_cli" if unsupported else "not_running",
-            "returncode": proc.returncode,
-            "error": err_text,
-        }
 
-    status_str = str(parsed.get("status") or "").strip().lower()
-    running = status_str == "running"
+def _parse_json_object(raw: bytes) -> Dict[str, Any]:
+    text = raw.decode("utf-8", errors="replace").strip()
+    # Some CLI builds print an informational warning before the JSON document.
+    for part in [text, *reversed(text.splitlines())]:
+        try:
+            parsed = json.loads(part)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    raise DaemonProbeError("Daemon version returned no JSON object.")
+
+
+def get_daemon_status(cli: CodexCLI, deadline: Deadline) -> Dict[str, Any]:
+    proc = None
+    try:
+        timeout = min(5.0, deadline.require())
+        proc = _spawn_proxy(cli, ["app-server", "daemon", "version"],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+        stdout, stderr = proc.communicate(timeout=min(timeout, deadline.require()))
+        if proc.returncode:
+            message = stderr.decode("utf-8", errors="replace").strip()
+            if "unrecognized subcommand" in message.lower():
+                raise DaemonUnavailableError("The resolved Codex CLI lacks app-server daemon support.")
+            raise DaemonProbeError(f"Daemon version failed (exit {proc.returncode}): {message}")
+        data = _parse_json_object(stdout)
+    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+        raise DaemonProbeError(f"Daemon version probe failed: {exc}") from exc
+    finally:
+        if proc is not None:
+            _terminate_proxy(proc)
+            for stream in (proc.stdout, proc.stderr):
+                if stream is not None:
+                    stream.close()
+
+    status = data.get("status")
+    if status not in ("running", "notRunning", "not_running", "stopped"):
+        raise DaemonProbeError(f"Unrecognized daemon version status: {status!r}")
     return {
-        "running": running,
-        "status": status_str or ("running" if proc.returncode == 0 else "stopped"),
-        "socket_path": str(parsed.get("socketPath") or ""),
-        "cli_version": str(parsed.get("cliVersion") or ""),
-        "app_server_version": str(parsed.get("appServerVersion") or ""),
-        "managed_codex_version": str(parsed.get("managedCodexVersion") or ""),
-        "backend": str(parsed.get("backend") or ""),
-        "raw": parsed,
+        "running": status == "running",
+        "status": status,
+        "socket_path": data.get("socketPath") or "",
+        "app_server_version": data.get("appServerVersion") or "",
     }
 
 
-def ensure_daemon_running(
-    timeout: float = 10.0,
-    settle_sec: float = 0.8,
-) -> Dict[str, Any]:
-    """Ensure the local managed Codex app-server daemon is running and persists.
-
-    If the daemon is not running, attempts `codex app-server daemon start`, waits
-    briefly, and verifies liveness via an independent cross-subprocess
-    `codex app-server daemon version` call. If a sandbox Job Object reclaims the
-    daemon immediately upon exit, raises DaemonUnavailableError with an explicit
-    instruction for the user to start it once on the main desktop.
-    """
-    initial = get_daemon_status(timeout=min(5.0, timeout))
-    if initial.get("running"):
-        return {**initial, "cold_started": False}
-
-    if initial.get("status") == "cli_not_found":
-        raise DaemonUnavailableError(
-            "codex CLI executable was not found in PATH.",
-            hint="Install Codex CLI and ensure `codex` is available in PATH.",
-        )
-    if initial.get("status") == "unsupported_cli":
-        raise DaemonUnavailableError(
-            "Installed Codex CLI does not support `codex app-server daemon`.",
-            hint="Upgrade Codex CLI (`codex update`) to a version supporting `codex app-server daemon`.",
-        )
-
-    start_err = ""
+def ensure_daemon_running(cli: CodexCLI, deadline: Deadline) -> Dict[str, Any]:
+    status = get_daemon_status(cli, deadline)
+    if status["running"]:
+        return status
     try:
-        start_proc = subprocess.run(
-            ["codex", "app-server", "daemon", "start"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=max(2.0, timeout),
-            check=False,
-            **_no_window_kwargs(),
+        command, env = cli.invocation(["app-server", "daemon", "start"])
+        proc = subprocess.run(
+            command, env=env, stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=deadline.require(), **_no_window(),
         )
-        if start_proc.returncode != 0:
-            start_err = (start_proc.stderr or start_proc.stdout).strip()
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        start_err = str(exc)
+    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+        raise DaemonUnavailableError(f"Daemon cold-start failed: {exc}") from exc
 
-    if settle_sec > 0:
-        time.sleep(settle_sec)
-
-    # Independent cross-subprocess liveness check (catches sandbox Job Object reclamation)
-    recheck = get_daemon_status(timeout=min(5.0, timeout))
-    if recheck.get("running"):
-        return {**recheck, "cold_started": True}
-
-    detail = start_err or recheck.get("error") or recheck.get("status") or "not_running"
+    while deadline.remaining():
+        status = get_daemon_status(cli, deadline)
+        if status["running"]:
+            return status
+        if proc.returncode:
+            break
+        time.sleep(min(0.2, deadline.remaining()))
     raise DaemonUnavailableError(
-        f"Local Codex app-server daemon is not running after cold-start attempt ({detail}).",
-        hint=(
-            "The sandbox environment may have reclaimed the daemon subprocess on exit (Job Object). "
-            "Run `codex app-server daemon start` once in a normal main-desktop terminal so the "
-            "managed daemon persists outside the sandbox, then retry."
-        ),
+        "The daemon did not remain available after cold start. "
+        "Start it from the main desktop and retry."
     )
 
 
 def build_ws_frame(opcode: int, payload: bytes, mask_key: Optional[bytes] = None) -> bytes:
-    """Encode a single FIN=1 client-masked RFC 6455 WebSocket frame (supports 7/16/64-bit lengths)."""
-    if mask_key is None:
-        mask_key = os.urandom(4)
-    if len(mask_key) != 4:
+    if opcode not in (_TEXT, _BINARY, _CLOSE, _PING, _PONG):
+        raise ValueError("Unsupported outgoing WebSocket opcode.")
+    if len(payload) > (_MAX_FRAME if opcode < _CLOSE else 125):
+        raise ValueError("Outgoing WebSocket frame is too large.")
+    key = os.urandom(4) if mask_key is None else mask_key
+    if len(key) != 4:
         raise ValueError("WebSocket mask key must be exactly 4 bytes.")
-
-    header = bytearray([0x80 | (opcode & 0x0F)])
     length = len(payload)
     if length < 126:
-        header.append(0x80 | length)
+        size = bytes([0x80 | length])
     elif length < 65536:
-        header.append(0x80 | 126)
-        header.extend(struct.pack("!H", length))
+        size = b"\xfe" + struct.pack("!H", length)
     else:
-        header.append(0x80 | 127)
-        header.extend(struct.pack("!Q", length))
+        size = b"\xff" + struct.pack("!Q", length)
+    return bytes([0x80 | opcode]) + size + key + bytes(
+        value ^ key[index & 3] for index, value in enumerate(payload)
+    )
 
-    masked = bytes(b ^ mask_key[i & 3] for i, b in enumerate(payload))
-    return bytes(header) + mask_key + masked
+
+def compute_ws_accept(key: str) -> str:
+    return base64.b64encode(hashlib.sha1((key + _WS_GUID).encode("ascii")).digest()).decode("ascii")
 
 
-def compute_ws_accept(sec_websocket_key: str) -> str:
-    digest = hashlib.sha1((sec_websocket_key + _WS_MAGIC_GUID).encode("ascii")).digest()
-    return base64.b64encode(digest).decode("ascii")
+def _validate_upgrade(raw: bytes, expected_accept: str) -> None:
+    lines = raw.decode("iso-8859-1").split("\r\n")
+    status = lines[0].split()
+    if status[:2] != ["HTTP/1.1", "101"]:
+        raise DaemonRPCError(f"WebSocket upgrade rejected: {lines[0]!r}")
+    headers: Dict[str, List[str]] = {}
+    for line in lines[1:]:
+        if not line:
+            break
+        name, separator, value = line.partition(":")
+        if not separator or not name or name != name.strip():
+            raise DaemonRPCError("Malformed WebSocket upgrade header.")
+        headers.setdefault(name.lower(), []).append(value.strip())
+
+    def tokens(name: str) -> List[str]:
+        return [token.strip().lower() for value in headers.get(name, []) for token in value.split(",")]
+
+    if (headers.get("sec-websocket-accept") != [expected_accept]
+            or "websocket" not in tokens("upgrade") or "upgrade" not in tokens("connection")
+            or "sec-websocket-extensions" in headers or "sec-websocket-protocol" in headers):
+        raise DaemonRPCError("Invalid or incomplete WebSocket upgrade headers.")
+
+
+def _validate_close(payload: bytes) -> None:
+    if len(payload) == 1:
+        raise WebSocketError("Malformed WebSocket Close payload.")
+    if not payload:
+        return
+    code = int.from_bytes(payload[:2], "big")
+    if code not in (1000, 1001, 1002, 1003, 1007, 1008, 1009, 1010, 1011, 1012, 1013, 1014) and not 3000 <= code <= 4999:
+        raise WebSocketError(f"Invalid WebSocket Close code: {code}")
+    try:
+        payload[2:].decode("utf-8")
+    except UnicodeError as exc:
+        raise WebSocketError("WebSocket Close reason is not UTF-8.", close_code=1007) from exc
 
 
 class CodexDaemonClient:
-    """RFC 6455 WebSocket + JSON-RPC 2.0 client over `codex app-server proxy`.
+    """One connection, one outstanding RPC, and one shared operation deadline."""
 
-    All reads and writes enforce strict wall-clock timeouts using background I/O
-    worker threads so an unresponsive socket or large frame can never block callers.
-    """
-
-    def __init__(
-        self,
-        timeout: float = 15.0,
-        socket_path: str = "",
-        client_name: str = "orchestrator-codex",
-        client_version: str = "1.0.0",
-    ) -> None:
-        self.timeout = max(1.0, float(timeout))
-        self.socket_path = socket_path.strip()
-        self.client_name = client_name
-        self.client_version = client_version
-        self._proc: Optional[subprocess.Popen[bytes]] = None
+    def __init__(self, cli: CodexCLI, deadline: Deadline, socket_path: str = "") -> None:
+        self.cli = cli
+        self.deadline = deadline
+        self.socket_path = socket_path
+        self._proc: Any = None
+        self._reader: Optional[threading.Thread] = None
+        self._workers: List[threading.Thread] = []
+        self._state_lock = threading.Lock()
+        self._call_lock = threading.Lock()
         self._write_lock = threading.Lock()
-        self._closed = False
+        self._shutdown_lock = threading.Lock()
+        self._peer_closed = threading.Event()
+        self._pending: Optional[Tuple[int, queue.Queue]] = None
+        self._terminal_error: Optional[DaemonRPCError] = None
         self._req_id = 0
-        self._initialized = False
-        self._reader_thread: Optional[threading.Thread] = None
-        self._incoming: "queue.Queue[Tuple[str, Any]]" = queue.Queue()
+        self._upgraded = False
+        self._closing = False
+        self._sent_close = False
 
     def __enter__(self) -> "CodexDaemonClient":
         self.connect()
         return self
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
-        self.close()
+        self.close(graceful=exc_type is None)
+
+    def _io(self, action: Callable[[], Any], timeout: float, description: str) -> Any:
+        if timeout <= 0:
+            raise DaemonRPCError(f"{description} timed out.")
+        result: queue.Queue = queue.Queue(maxsize=1)
+
+        def run() -> None:
+            try:
+                result.put((True, action()))
+            except Exception as exc:
+                result.put((False, exc))
+
+        worker = threading.Thread(target=run, daemon=True)
+        with self._state_lock:
+            if self._proc is None:
+                raise DaemonRPCError("The daemon proxy connection is closed.")
+            self._workers = [previous for previous in self._workers if previous.is_alive()]
+            self._workers.append(worker)
+            worker.start()
+        try:
+            ok, item = result.get(timeout=timeout)
+        except queue.Empty as exc:
+            raise DaemonRPCError(f"{description} timed out.") from exc
+        if not ok:
+            raise DaemonRPCError(f"{description} failed: {item}") from item
+        return item
 
     def _write_all_with_timeout(self, data: bytes, timeout: float) -> None:
         proc = self._proc
-        if proc is None or proc.stdin is None or self._closed:
-            raise DaemonRPCError("Daemon proxy connection is closed.")
 
-        err_box: List[BaseException] = []
+        def write() -> None:
+            with self._write_lock:
+                pending = memoryview(data)
+                while pending:
+                    count = proc.stdin.write(pending)
+                    if not count:
+                        raise EOFError("Proxy stdin was closed.")
+                    pending = pending[count:]
+                proc.stdin.flush()
 
-        def _do_write() -> None:
-            try:
-                with self._write_lock:
-                    assert proc.stdin is not None
-                    proc.stdin.write(data)
-                    proc.stdin.flush()
-            except BaseException as exc:
-                err_box.append(exc)
+        self._io(write, timeout, "Writing to app-server proxy")
 
-        writer = threading.Thread(target=_do_write, daemon=True)
-        writer.start()
-        writer.join(timeout=timeout)
-        if writer.is_alive():
-            self.close()
-            raise DaemonRPCError(f"Write to `codex app-server proxy` timed out after {timeout:g}s.")
-        if err_box:
-            raise DaemonRPCError(f"Write to `codex app-server proxy` failed: {err_box[0]}") from err_box[0]
-
-    def _read_exact_raw(self, n: int) -> bytes:
+    def _read_exact(self, size: int) -> bytes:
+        data = bytearray()
         proc = self._proc
-        if proc is None or proc.stdout is None:
-            raise EOFError("Daemon proxy stdout unavailable.")
-        buf = bytearray()
-        while len(buf) < n:
-            chunk = proc.stdout.read(n - len(buf))
+        if proc is None:
+            raise EOFError("Proxy stdout is closed.")
+        while len(data) < size:
+            chunk = proc.stdout.read(size - len(data))
             if not chunk:
-                raise EOFError("Unexpected EOF from `codex app-server proxy`.")
-            buf.extend(chunk)
-        return bytes(buf)
+                raise EOFError("Unexpected EOF from app-server proxy.")
+            data.extend(chunk)
+        return bytes(data)
 
-    def _read_http_headers_with_timeout(self, timeout: float) -> bytes:
-        box: Dict[str, Any] = {}
-
-        def _read_hdr() -> None:
-            try:
-                resp = bytearray()
-                while b"\r\n\r\n" not in resp:
-                    if len(resp) > 65536:
-                        raise DaemonRPCError("HTTP WebSocket upgrade response exceeded 64 KiB.")
-                    resp.extend(self._read_exact_raw(1))
-                box["data"] = bytes(resp)
-            except BaseException as exc:
-                box["err"] = exc
-
-        t = threading.Thread(target=_read_hdr, daemon=True)
-        t.start()
-        t.join(timeout=timeout)
-        if t.is_alive():
-            self.close()
-            raise DaemonRPCError(f"WebSocket handshake timed out after {timeout:g}s.")
-        if "err" in box:
-            raise DaemonRPCError(f"WebSocket handshake failed: {box['err']}") from box["err"]
-        return box["data"]
-
-    def _reader_loop(self) -> None:
-        fragments: List[bytes] = []
-        frag_opcode: Optional[int] = None
-        try:
-            while not self._closed:
-                hdr = self._read_exact_raw(2)
-                fin = bool(hdr[0] & 0x80)
-                opcode = hdr[0] & 0x0F
-                masked = bool(hdr[1] & 0x80)
-                length = hdr[1] & 0x7F
-                if length == 126:
-                    length = struct.unpack("!H", self._read_exact_raw(2))[0]
-                elif length == 127:
-                    length = struct.unpack("!Q", self._read_exact_raw(8))[0]
-                mask = self._read_exact_raw(4) if masked else b""
-                payload = self._read_exact_raw(length) if length else b""
-                if masked:
-                    payload = bytes(b ^ mask[i & 3] for i, b in enumerate(payload))
-
-                # Control frames (RFC 6455 §5.5) may be injected between fragments
-                if opcode == _OP_PING:
-                    try:
-                        self._write_all_with_timeout(build_ws_frame(_OP_PONG, payload), min(3.0, self.timeout))
-                    except DaemonRPCError:
-                        pass
-                    continue
-                if opcode == _OP_PONG:
-                    continue
-                if opcode == _OP_CLOSE:
-                    self._incoming.put(("eof", "WebSocket closed by daemon"))
-                    return
-
-                if opcode in (_OP_TEXT, _OP_BINARY):
-                    if frag_opcode is not None:
-                        fragments.clear()
-                    frag_opcode = opcode
-                    fragments.append(payload)
-                elif opcode == _OP_CONT:
-                    if frag_opcode is None:
-                        continue
-                    fragments.append(payload)
-                else:
-                    continue
-
-                if fin:
-                    full = b"".join(fragments)
-                    fragments.clear()
-                    cur_op = frag_opcode
-                    frag_opcode = None
-                    if cur_op == _OP_TEXT:
-                        try:
-                            msg = json.loads(full.decode("utf-8", errors="replace"))
-                            if isinstance(msg, dict):
-                                self._incoming.put(("msg", msg))
-                        except json.JSONDecodeError:
-                            continue
-        except BaseException as exc:
-            if not self._closed:
-                self._incoming.put(("err", exc))
+    def _read_headers(self) -> bytes:
+        raw = bytearray()
+        while not raw.endswith(b"\r\n\r\n"):
+            if len(raw) >= _MAX_HEADERS:
+                raise DaemonRPCError("WebSocket upgrade headers exceeded 64 KiB.")
+            raw.extend(self._read_exact(1))
+        return bytes(raw)
 
     def connect(self) -> None:
-        if self._proc is not None and not self._closed:
-            return
-        cmd = ["codex", "app-server", "proxy"]
+        if self._proc is not None or self._closing:
+            raise DaemonRPCError("A daemon client is single use.")
+        args = ["app-server", "proxy"]
         if self.socket_path:
-            cmd += ["--sock", self.socket_path]
+            args.extend(["--sock", self.socket_path])
         try:
-            self._proc = subprocess.Popen(
-                cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                **_no_window_kwargs(),
+            self.deadline.require()
+            self._proc = _spawn_proxy(
+                self.cli, args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, bufsize=0,
             )
-        except OSError as exc:
-            raise DaemonRPCError(f"Failed to spawn `codex app-server proxy`: {exc}") from exc
+            key = base64.b64encode(os.urandom(16)).decode("ascii")
+            request = (
+                "GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n"
+                f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
+                "Sec-WebSocket-Version: 13\r\n\r\n"
+            ).encode("ascii")
+            self._write_all_with_timeout(request, self.deadline.remaining())
+            raw = self._io(self._read_headers, self.deadline.remaining(), "WebSocket upgrade")
+            _validate_upgrade(raw, compute_ws_accept(key))
+            self._upgraded = True
+            self._reader = threading.Thread(target=self._reader_loop, daemon=True)
+            self._reader.start()
+            self.call("initialize", {"clientInfo": {
+                "name": "orchestrator-codex", "title": "Orchestrator Codex", "version": "1.0.0",
+            }})
+            self._send_json({"method": "initialized"}, self.deadline.remaining())
+        except BaseException as exc:
+            self.close(graceful=False)
+            if isinstance(exc, (OSError, ValueError)):
+                raise DaemonRPCError(f"Could not initialize app-server proxy: {exc}") from exc
+            raise
 
-        ws_key = base64.b64encode(os.urandom(16)).decode("ascii")
-        expected_accept = compute_ws_accept(ws_key)
-        handshake = (
-            "GET / HTTP/1.1\r\n"
-            "Host: localhost\r\n"
-            "Upgrade: websocket\r\n"
-            "Connection: Upgrade\r\n"
-            f"Sec-WebSocket-Key: {ws_key}\r\n"
-            "Sec-WebSocket-Version: 13\r\n\r\n"
-        ).encode("ascii")
-        self._write_all_with_timeout(handshake, self.timeout)
-        raw_resp = self._read_http_headers_with_timeout(self.timeout)
-        resp_text = raw_resp.decode("utf-8", errors="replace")
-        status_line = resp_text.splitlines()[0] if resp_text else ""
-        if " 101 " not in status_line:
-            self.close()
-            raise DaemonRPCError(f"WebSocket upgrade rejected by daemon: {status_line!r}")
+    def _accept_message(self, message: Dict[str, Any]) -> None:
+        identifier = message.get("id")
+        if "method" in message:
+            if type(identifier) in (int, str) and not self._closing:
+                self._send_json({"id": identifier, "error": {
+                    "code": -32601, "message": "This control client does not handle server requests.",
+                }}, self.deadline.remaining())
+            return
+        if type(identifier) is not int or ("result" in message) == ("error" in message):
+            return
+        with self._state_lock:
+            if self._pending is not None and self._pending[0] == identifier:
+                inbox = self._pending[1]
+                if inbox.empty():
+                    inbox.put_nowait(message)
 
-        headers_lower = {}
-        for line in resp_text.splitlines()[1:]:
-            if ":" in line:
-                k, v = line.split(":", 1)
-                headers_lower[k.strip().lower()] = v.strip()
-        accept_hdr = headers_lower.get("sec-websocket-accept", "")
-        if accept_hdr and accept_hdr != expected_accept:
-            self.close()
-            raise DaemonRPCError("WebSocket Sec-WebSocket-Accept validation failed.")
+    def _signal_error(self, error: DaemonRPCError) -> None:
+        with self._state_lock:
+            if self._terminal_error is None:
+                self._terminal_error = error
+            if self._pending is not None and self._pending[1].empty():
+                self._pending[1].put_nowait(error)
 
-        self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
-        self._reader_thread.start()
+    def _reader_loop(self) -> None:
+        fragment_opcode = None
+        fragments = bytearray()
+        try:
+            while True:
+                first, second = self._read_exact(2)
+                fin, opcode, length = bool(first & 0x80), first & 0x0F, second & 0x7F
+                if first & 0x70 or second & 0x80 or opcode not in (_CONT, _TEXT, _BINARY, _CLOSE, _PING, _PONG):
+                    raise WebSocketError("Invalid WebSocket RSV, mask or opcode from server.")
+                if opcode >= _CLOSE and (not fin or length > 125):
+                    raise WebSocketError("Invalid WebSocket control frame.")
+                if length == 126:
+                    length = struct.unpack("!H", self._read_exact(2))[0]
+                    if length < 126:
+                        raise WebSocketError("Non-minimal WebSocket frame length.")
+                elif length == 127:
+                    length = struct.unpack("!Q", self._read_exact(8))[0]
+                    if length & (1 << 63) or length < 65536:
+                        raise WebSocketError("Invalid 64-bit WebSocket frame length.")
+                if opcode < _CLOSE and (opcode == _CONT) != (fragment_opcode is not None):
+                    raise WebSocketError("Invalid WebSocket continuation sequence.")
+                if length > _MAX_FRAME or (opcode < _CLOSE and len(fragments) + length > _MAX_MESSAGE):
+                    raise WebSocketError("WebSocket frame or message exceeded its size limit.", close_code=1009)
+                payload = self._read_exact(length)
+                if opcode == _CLOSE:
+                    _validate_close(payload)
+                    self._send_close(payload)
+                    self._peer_closed.set()
+                    self._signal_error(DaemonRPCError("WebSocket closed by app-server proxy."))
+                    return
+                if opcode == _PING:
+                    if not self._closing:
+                        self._write_all_with_timeout(build_ws_frame(_PONG, payload), self.deadline.remaining())
+                    continue
+                if opcode == _PONG:
+                    continue
 
-        self.call(
-            "initialize",
-            {
-                "clientInfo": {
-                    "name": self.client_name,
-                    "title": self.client_name,
-                    "version": self.client_version,
-                }
-            },
-        )
-        self.notify("initialized", {})
-        self._initialized = True
+                if opcode != _CONT:
+                    fragment_opcode = opcode
+                fragments.extend(payload)
+                if fin:
+                    if fragment_opcode == _TEXT and not self._closing:
+                        try:
+                            message = json.loads(fragments.decode("utf-8"))
+                        except UnicodeError as exc:
+                            raise WebSocketError("WebSocket text is not UTF-8.", close_code=1007) from exc
+                        if isinstance(message, dict):
+                            self._accept_message(message)
+                    fragments.clear()
+                    fragment_opcode = None
+        except (EOFError, OSError, ValueError, DaemonRPCError) as exc:
+            if not self._closing:
+                self._signal_error(DaemonRPCError(f"Reading app-server proxy failed: {exc}"))
+                if isinstance(exc, WebSocketError):
+                    try:
+                        self._send_close(struct.pack("!H", exc.close_code))
+                    except DaemonRPCError:
+                        pass
+        finally:
+            if not self._closing:
+                self.close(graceful=False)
 
-    def notify(self, method: str, params: Optional[Dict[str, Any]] = None) -> None:
-        payload = json.dumps(
-            {"jsonrpc": "2.0", "method": method, "params": params or {}},
-            ensure_ascii=False,
-        ).encode("utf-8")
-        self._write_all_with_timeout(build_ws_frame(_OP_TEXT, payload), self.timeout)
+    def _send_json(self, message: Dict[str, Any], timeout: float) -> None:
+        data = json.dumps({"jsonrpc": "2.0", **message}, ensure_ascii=False).encode("utf-8")
+        try:
+            frame = build_ws_frame(_TEXT, data)
+        except ValueError as exc:
+            raise DaemonRPCError(str(exc)) from exc
+        self._write_all_with_timeout(frame, timeout)
 
-    def call(
-        self,
-        method: str,
-        params: Optional[Dict[str, Any]] = None,
-        timeout: Optional[float] = None,
-    ) -> Dict[str, Any]:
-        op_timeout = self.timeout if timeout is None else max(0.5, float(timeout))
-        self._req_id += 1
-        req_id = self._req_id
-        payload = json.dumps(
-            {"jsonrpc": "2.0", "id": req_id, "method": method, "params": params or {}},
-            ensure_ascii=False,
-        ).encode("utf-8")
-        self._write_all_with_timeout(build_ws_frame(_OP_TEXT, payload), op_timeout)
+    def _send_close(self, payload: bytes) -> None:
+        with self._state_lock:
+            if self._sent_close:
+                return
+            self._sent_close = True
+        self._write_all_with_timeout(build_ws_frame(_CLOSE, payload), _CLOSE_TIMEOUT)
 
-        deadline = time.monotonic() + op_timeout
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise DaemonRPCError(f"RPC `{method}` timed out after {op_timeout:g}s.")
+    def call(self, method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        if not self._call_lock.acquire(timeout=self.deadline.remaining()):
+            raise DaemonRPCError(f"RPC {method!r} timed out waiting for another call.")
+        try:
+            with self._state_lock:
+                if self._terminal_error is not None:
+                    raise self._terminal_error
+                if self._closing:
+                    raise DaemonRPCError("The daemon proxy connection is closed.")
+                self._req_id += 1
+                request_id = self._req_id
+                inbox: queue.Queue = queue.Queue(maxsize=1)
+                self._pending = (request_id, inbox)
             try:
-                kind, item = self._incoming.get(timeout=remaining)
-            except queue.Empty:
-                raise DaemonRPCError(f"RPC `{method}` timed out after {op_timeout:g}s.")
-            if kind == "err":
-                raise DaemonRPCError(f"Daemon connection error during `{method}`: {item}") from item
-            if kind == "eof":
-                raise DaemonRPCError(f"Daemon closed connection during `{method}`: {item}")
-            if isinstance(item, dict) and item.get("id") == req_id:
-                if "error" in item and item["error"] is not None:
-                    err = item["error"]
-                    msg = err.get("message") if isinstance(err, dict) else str(err)
-                    raise DaemonRPCError(f"Daemon RPC `{method}` returned error: {msg}")
-                result = item.get("result")
-                return result if isinstance(result, dict) else {"value": result}
+                self._send_json({"id": request_id, "method": method, "params": params or {}},
+                                self.deadline.remaining())
+                response = inbox.get(timeout=self.deadline.remaining())
+            except queue.Empty as exc:
+                self.close(graceful=False)
+                raise DaemonRPCError(f"RPC {method!r} timed out.") from exc
+            except DaemonRPCError:
+                self.close(graceful=False)
+                raise
+            if isinstance(response, DaemonRPCError):
+                raise response
+            if "error" in response:
+                error = response["error"]
+                message = error.get("message") if isinstance(error, dict) else error
+                raise DaemonRPCError(f"RPC {method!r} failed: {message}")
+            result = response["result"]
+            return result if isinstance(result, dict) else {"value": result}
+        finally:
+            with self._state_lock:
+                self._pending = None
+            self._call_lock.release()
 
     def list_loaded_threads(self) -> List[str]:
-        loaded: List[str] = []
-        cursor: Optional[str] = None
-        for _ in range(20):
-            params: Dict[str, Any] = {}
-            if cursor:
-                params["cursor"] = cursor
-            res = self.call("thread/loaded/list", params)
-            batch = res.get("data") or []
-            if isinstance(batch, list):
-                for item in batch:
-                    if isinstance(item, str) and item not in loaded:
-                        loaded.append(item)
-            next_cursor = res.get("nextCursor")
-            if not next_cursor:
-                break
-            cursor = str(next_cursor)
-        return loaded
+        loaded: Dict[str, None] = {}
+        cursors = set()
+        cursor = None
+        for _ in range(_MAX_PAGES):
+            result = self.call("thread/loaded/list", {"cursor": cursor} if cursor else {})
+            data = result.get("data")
+            if not isinstance(data, list) or not all(isinstance(item, str) for item in data):
+                raise DaemonProbeError("thread/loaded/list returned an invalid page.")
+            loaded.update(dict.fromkeys(data))
+            cursor = result.get("nextCursor")
+            if not cursor:
+                return list(loaded)
+            if not isinstance(cursor, str) or cursor in cursors:
+                raise DaemonProbeError("thread/loaded/list returned an invalid or repeated cursor.")
+            cursors.add(cursor)
+        raise DaemonProbeError("thread/loaded/list exceeded its pagination limit.")
 
-    def start_thread(
-        self,
-        cwd: str,
-        model: str,
-        effort: str,
-        sandbox: str = "",
-        approval: str = "",
-    ) -> Dict[str, Any]:
-        params: Dict[str, Any] = {
-            "cwd": cwd,
-            "model": model,
-            "config": {"model_reasoning_effort": effort},
-        }
-        if sandbox:
-            params["sandbox"] = sandbox
-        if approval:
-            params["approvalPolicy"] = approval
-
-        res = self.call("thread/start", params)
-        thread = res.get("thread") if isinstance(res.get("thread"), dict) else {}
-        thread_id = str(thread.get("id") or "").strip()
-        if not thread_id:
-            raise DaemonRPCError("`thread/start` succeeded without returning thread.id.")
-        return {
-            "thread_id": thread_id,
-            "session_file": str(thread.get("path") or ""),
-            "model": str(res.get("model") or model),
-            "reasoning_effort": str(res.get("reasoningEffort") or effort),
-            "approval_policy": res.get("approvalPolicy"),
-            "sandbox": res.get("sandbox"),
-            "raw": res,
-        }
-
-    def resume_thread(
-        self,
-        thread_id: str,
-        cwd: str = "",
-        model: str = "",
-        effort: str = "",
-        sandbox: str = "",
-        approval: str = "",
-        exclude_turns: bool = True,
-    ) -> Dict[str, Any]:
-        params: Dict[str, Any] = {
-            "threadId": thread_id,
-            "excludeTurns": bool(exclude_turns),
-        }
-        if cwd:
-            params["cwd"] = cwd
-        if model:
-            params["model"] = model
-        if effort:
-            params["config"] = {"model_reasoning_effort": effort}
-        if sandbox:
-            params["sandbox"] = sandbox
-        if approval:
-            params["approvalPolicy"] = approval
-
-        res = self.call("thread/resume", params)
-        thread = res.get("thread") if isinstance(res.get("thread"), dict) else {}
-        resolved_id = str(thread.get("id") or thread_id).strip()
-        return {
-            "thread_id": resolved_id,
-            "session_file": str(thread.get("path") or ""),
-            "model": str(res.get("model") or model),
-            "reasoning_effort": str(res.get("reasoningEffort") or effort),
-            "approval_policy": res.get("approvalPolicy"),
-            "sandbox": res.get("sandbox"),
-            "raw": res,
-        }
-
-    def interrupt_active_turn(self, thread_id: str) -> bool:
-        """Best-effort interrupt of an active turn on thread_id (no-op if idle)."""
+    def read_thread(self, thread_id: str, include_turns: bool = False) -> Dict[str, Any]:
+        thread = self.call("thread/read", {"threadId": thread_id, "includeTurns": include_turns}).get("thread")
         try:
-            res = self.call("thread/read", {"threadId": thread_id, "includeTurns": True}, timeout=5.0)
-        except DaemonRPCError:
-            return False
-        thread = res.get("thread") if isinstance(res.get("thread"), dict) else {}
-        turns = thread.get("turns") if isinstance(thread.get("turns"), list) else []
-        for turn in reversed(turns):
-            if not isinstance(turn, dict):
-                continue
-            status = str(turn.get("status") or "").lower()
-            turn_id = str(turn.get("id") or "").strip()
-            if turn_id and status in ("inprogress", "in_progress", "running", "active", "queued"):
-                try:
-                    self.call("turn/interrupt", {"threadId": thread_id, "turnId": turn_id}, timeout=5.0)
-                    return True
-                except DaemonRPCError:
-                    return False
-        return False
-
-    def unsubscribe_thread(self, thread_id: str) -> Dict[str, Any]:
-        """Gracefully unsubscribe thread_id on the managed daemon (never kills daemon/processes)."""
-        res = self.call("thread/unsubscribe", {"threadId": thread_id})
-        status = str(res.get("status") or "")
-        if status == "notSubscribed":
-            # A fresh proxy connection is not subscribed yet; rejoin briefly then unsubscribe cleanly
-            try:
-                loaded = self.list_loaded_threads()
-                if thread_id in loaded:
-                    self.call("thread/resume", {"threadId": thread_id, "excludeTurns": True})
-                    res = self.call("thread/unsubscribe", {"threadId": thread_id})
-            except DaemonRPCError:
-                pass
-        return res
-
-    def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        proc = self._proc
-        self._proc = None
-        if proc is None:
-            return
-        try:
-            if proc.stdin is not None:
-                try:
-                    proc.stdin.write(build_ws_frame(_OP_CLOSE, b""))
-                    proc.stdin.flush()
-                except OSError:
-                    pass
-                try:
-                    proc.stdin.close()
-                except OSError:
-                    pass
-        except Exception:
+            if isinstance(thread, dict) and canonical_uuid(thread.get("id")) == thread_id:
+                return thread
+        except ValueError:
             pass
+        raise ThreadOwnershipError("thread/read did not return the requested thread UUID.")
+
+    def verify_thread(self, thread_id: str, root: Any) -> None:
+        if not same_project(self.read_thread(thread_id).get("cwd"), root):
+            raise ThreadOwnershipError("The daemon thread does not belong to this project.")
+
+    def start_thread(self, cwd: str, model: str, effort: str, sandbox: str, approval: str,
+                     thread_id: str = "") -> Dict[str, Any]:
+        if not approval:
+            raise ValueError("Daemon threads require an explicit approval policy.")
+        params: Dict[str, Any] = {
+            "cwd": cwd, "model": model, "config": {"model_reasoning_effort": effort},
+            "sandbox": sandbox, "approvalPolicy": approval,
+        }
+        if thread_id:
+            params.update(threadId=thread_id, excludeTurns=True)
+        return self.call("thread/resume" if thread_id else "thread/start", params)
+
+    def start_turn(self, thread_id: str, message: str) -> Dict[str, Any]:
+        result = self.call("turn/start", {
+            "threadId": thread_id, "input": [{"type": "text", "text": message, "text_elements": []}],
+        })
+        turn = result.get("turn")
+        if not isinstance(turn, dict) or not isinstance(turn.get("id"), str) or not turn["id"]:
+            raise DaemonRPCError("turn/start returned no turn ID.")
+        if turn.get("status") not in ("inProgress", "completed"):
+            raise DaemonRPCError(f"turn/start did not confirm execution (status {turn.get('status')!r}).")
+        return turn
+
+    def interrupt_active_turn(self, thread_id: str) -> str:
+        thread = self.read_thread(thread_id, include_turns=True)
+        status = thread.get("status")
+        if not isinstance(status, dict):
+            raise DaemonRPCError("thread/read did not return the thread's runtime status.")
+        if status.get("type") in ("idle", "notLoaded"):
+            return status["type"]
+        if status.get("type") != "active":
+            raise DaemonRPCError(f"Cannot confirm the active turn state: {status!r}")
+        turns = thread.get("turns")
+        if not isinstance(turns, list):
+            raise DaemonRPCError("thread/read did not return turn history.")
+        current = next((turn for turn in reversed(turns) if isinstance(turn, dict)
+                        and turn.get("status") == "inProgress"), None)
+        if not current or not isinstance(current.get("id"), str) or not current["id"]:
+            raise DaemonRPCError("Could not identify the active turn to interrupt.")
+        turn_id = current["id"]
+        self.call("turn/interrupt", {"threadId": thread_id, "turnId": turn_id})
+        while self.deadline.remaining():
+            after = self.read_thread(thread_id, include_turns=True)
+            runtime = after.get("status")
+            if isinstance(runtime, dict) and runtime.get("type") == "notLoaded":
+                return "notLoaded"
+            if isinstance(runtime, dict) and runtime.get("type") == "idle":
+                recent = after.get("turns")
+                finished = next((turn for turn in reversed(recent) if isinstance(turn, dict)
+                                 and turn.get("id") == turn_id), None) if isinstance(recent, list) else None
+                if finished and finished.get("status") in ("interrupted", "completed", "failed"):
+                    return finished["status"]
+            time.sleep(min(0.1, self.deadline.remaining()))
+        raise DaemonRPCError("The active turn did not finish after interruption.")
+
+    def unsubscribe_thread(self, thread_id: str) -> str:
+        status = self.call("thread/unsubscribe", {"threadId": thread_id}).get("status")
+        if status not in ("unsubscribed", "notSubscribed", "notLoaded"):
+            raise DaemonRPCError(f"Unrecognized thread/unsubscribe status: {status!r}")
+        return status
+
+    def close(self, graceful: bool = True) -> None:
+        if not self._shutdown_lock.acquire(blocking=False):
+            return
         try:
-            proc.terminate()
-            proc.wait(timeout=2.0)
-        except Exception:
+            self._closing = True
+            self._signal_error(DaemonRPCError("The daemon proxy connection is closed."))
+            proc = self._proc
+            if proc is None:
+                return
             try:
-                proc.kill()
-                proc.wait(timeout=1.0)
-            except Exception:
-                pass
+                if graceful and self._upgraded and proc.poll() is None:
+                    try:
+                        self._send_close(b"")
+                        self._peer_closed.wait(_CLOSE_TIMEOUT)
+                    except DaemonRPCError:
+                        pass
+
+                # Break blocked OS pipe I/O before touching any stream or joining a worker.
+                _terminate_proxy(proc)
+            finally:
+                with self._state_lock:
+                    self._proc = None
+                    workers = [*self._workers]
+                if self._reader is not None and self._reader.ident is not None:
+                    workers.append(self._reader)
+
+                def release_streams() -> None:
+                    caller = threading.current_thread()
+                    for worker in workers:
+                        if worker is not caller:
+                            worker.join()
+                    for stream in (proc.stdin, proc.stdout, proc.stderr):
+                        if stream is not None:
+                            try:
+                                stream.close()
+                            except OSError:
+                                pass
+
+                # Even an unexpected extra peer handle cannot make caller cleanup block.
+                if self._reader is threading.current_thread():
+                    workers.remove(self._reader)
+                reap = threading.Thread(target=release_streams, daemon=True)
+                reap.start()
+                reap.join(0.5)
+        finally:
+            self._shutdown_lock.release()
 
 
-def check_daemon_thread_loaded(
-    thread_id: str,
-    timeout: float = 8.0,
-) -> Tuple[bool, str, Dict[str, Any]]:
-    """Return (is_loaded, reason, daemon_info) for a DAEMON_MANAGED thread."""
-    if not thread_id:
-        return False, "missing_thread_id", {}
-    info = get_daemon_status(timeout=min(5.0, timeout))
-    if not info.get("running"):
-        return False, "daemon_not_running", info
-    try:
-        with CodexDaemonClient(timeout=timeout, socket_path=info.get("socket_path", "")) as client:
-            loaded = client.list_loaded_threads()
-    except DaemonRPCError as exc:
-        return False, f"daemon_rpc_error:{exc}", info
-    if thread_id in loaded:
-        return True, "loaded_in_daemon", info
-    return False, "thread_not_loaded", info
+def check_daemon_thread_loaded(cli: CodexCLI, deadline: Deadline, thread_id: str, root: Any) -> bool:
+    status = get_daemon_status(cli, deadline)
+    if not status["running"]:
+        return False
+    with CodexDaemonClient(cli, deadline, status["socket_path"]) as client:
+        if thread_id not in client.list_loaded_threads():
+            return False
+        client.verify_thread(thread_id, root)
+        return True
