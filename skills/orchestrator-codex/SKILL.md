@@ -4,11 +4,13 @@ description: >-
   Orchestrate a dual-window Gemini (Antigravity) + Codex CLI workflow where Gemini
   serves as orchestrator, sole human interface, and frontend/UI lead while treating
   an interactive Codex CLI window as a behind-the-scenes backend Subagent via
-  `codex queue`, with automated thread UUID discovery, completion polling,
-  ask-don't-guess clarification gates, tiered Git branch governance, and strict
-  diff-based acceptance review. Trigger when coordinating full-stack features,
-  dispatching backend/logic/audit work to Codex ("派给 Codex", "delegate to Codex",
-  "双窗口协作"), or inspecting Codex output ("验收", "review Codex diff").
+  `codex queue`, with automated standalone Codex window launching (user-specified
+  model, reasoning effort, and task-aligned permissions), automated thread UUID
+  discovery/binding, completion polling, ask-don't-guess clarification gates,
+  tiered Git branch governance, and strict diff-based acceptance review. Trigger
+  when coordinating full-stack features, dispatching backend/logic/audit work to
+  Codex ("派给 Codex", "delegate to Codex", "双窗口协作"), launching or reconfiguring
+  a Codex Subagent window, or inspecting Codex output ("验收", "review Codex diff").
   Do NOT trigger for small inline edits (<= 10 lines), pure frontend UI/CSS/animation/copy
   work, general Q&A or code explanations, or when the user asks to implement
   everything directly in a single agent without Codex delegation.
@@ -27,7 +29,9 @@ Gemini (Antigravity) is the **Orchestrator Lead, Sole Human Interface, and Front
    - **Gemini**: Requirements, `docs/architecture.md`, API contracts, **all frontend UI/CSS/animations/interactions & user-facing copy**, Git branch/commit lifecycle, independent diff review, plain-language reporting.
    - **Codex Subagent**: Backend APIs, DB schemas/migrations/queries, business logic, scripts, headless pure-logic modules (state machines, parsers, algorithms, utilities), and unit/integration tests.
    - **Error Codes vs. UI Copy**: Backend returns structured error codes + machine params ONLY; Codex NEVER authors user-facing UI copy.
-5. **Model & Control Decoupling**: The user manually controls model, reasoning effort, fast mode, and permission approvals in both windows. **NEVER pass `-m`, `--model`, `-c model=...`, or reasoning/speed override flags** (`-c model_reasoning_effort=...`, `-c service_tier=...`, etc.) to `codex queue` or fallback `codex exec`.
+5. **User-Owned Model, Effort & Permission Control**:
+   - **New / Reopened Window**: Model and reasoning effort MUST always be explicitly chosen by the user from real local models (`start_codex_window.py --list-models`). Never pick on the user's behalf, guess model names, or fall back to `config.toml` defaults.
+   - **Subsequent Dispatches (`codex queue` / fallback `codex exec`)**: **NEVER pass `-m`, `--model`, `-c model=...`, `-c model_reasoning_effort=...`, or `-c service_tier=...` override flags**, so in-place `/model` and `/permissions` changes made inside the right-hand Codex window stay active.
 
 ## 2. Architecture Blueprint & Tiered Git Branch Governance
 
@@ -38,7 +42,7 @@ Gemini (Antigravity) is the **Orchestrator Lead, Sole Human Interface, and Front
   - **`FEATURE_IMPL`, multi-file refactors, or high-risk changes**: Confirm a clean working tree, **confirm the branch name with the user first**, then switch to `feat/<slug>` or `fix/<slug>`.
 - **Post-Branch-Switch Mandate**: On the first dispatch after switching branches, record `Git Branch`, `Baseline Commit`, and `Branch Switched: Yes` at the top of `task.md` and explicitly require Codex to **re-read all target files from disk** rather than relying on prior conversation memory.
 
-## 3. Pre-Flight Checks & Automated Thread UUID Discovery
+## 3. Pre-Flight, Session Binding & Automated Window Launch
 
 Before the first dispatch in a session:
 1. Verify Codex CLI (`where.exe codex` / `command -v -a codex` for multi-version conflicts, `codex --version`, `codex queue --help`) and confirm `.agent-collab/` is ignored in `.gitignore` or `.git/info/exclude`.
@@ -46,16 +50,46 @@ Before the first dispatch in a session:
    ```bash
    python "<SKILL_DIR>/scripts/find_codex_thread.py" --cwd "<REPO_ROOT>"
    ```
-   - `STATUS: CACHED` / `AUTO_SELECTED` (`exit 0`): Use printed `THREAD_ID` directly (cached in `.agent-collab/session.json`).
-   - `STATUS: MULTIPLE_MATCHES` (`exit 2`): Show the concise numbered candidates to the user, ask them to reply `1`/`2`, then pin via `--select <UUID>`.
-   - `STATUS: NOT_FOUND` (`exit 1`): Ask the user to open Codex CLI in `<REPO_ROOT>`, send `hi`, then rerun with `--refresh`.
-   - **Auto-Rebind on Failure**: If `codex queue` reports an invalid/expired thread, automatically rerun `find_codex_thread.py --cwd "<REPO_ROOT>" --refresh` and retry `codex queue` once.
-   - **Context Freshness**: After merging a major feature and starting an unrelated module, remind the user to run `/new` + send `hi` in the right window.
+   - **`STATUS: CACHED` / `AUTO_SELECTED` / `AUTO_SELECTED_STALE` (`exit 0`)**: If `.agent-collab/session.json` already holds a valid binding for this repo and the user has NOT asked to reconfigure, **reuse that `THREAD_ID` directly without asking again**.
+   - **Stale / Closed Window Recovery**: If `codex queue --thread "<UUID>"` reports an invalid or expired session (old window closed), first rerun `find_codex_thread.py --cwd "<REPO_ROOT>" --refresh`. If an existing session is resolved unambiguously, rebind and retry once; if `NOT_FOUND`, transition automatically into the **New-Window Launch Flow** below.
+   - **`STATUS: MULTIPLE_MATCHES` (`exit 2`)**: Present every candidate as **`[编号] <UUID短码> | 模型: <model> | 最近活跃: <last_active> | 首句摘要: <first_user_message>`**, and **ALWAYS** append the fixed option:
+     - `[0] 不复用现有窗口，按新指定的模型与思考强度新建一个 Codex 窗口`
+     - If the user picks `1`/`2`..., pin with `find_codex_thread.py --cwd "<REPO_ROOT>" --select <UUID>`. If the user picks `[0]`, enter the **New-Window Launch Flow** (`--force-new`).
+   - **`STATUS: NOT_FOUND` (`exit 1`)**: Enter the **New-Window Launch Flow** directly (no need to make the user open a terminal manually).
+
+### New / Reopened Window Launch Flow ([start_codex_window.py](./scripts/start_codex_window.py))
+
+Applies whenever `NOT_FOUND`, user selects `[0]`, or user asks Gemini to reconfigure (`--force-new`):
+
+1. **Mandatory User-Specified Model & Effort**:
+   - Both **model** and **reasoning effort** MUST be explicitly specified by the user.
+   - If either is missing from the user's request, Gemini MUST first probe real local models (never guess model names):
+     ```bash
+     python "<SKILL_DIR>/scripts/start_codex_window.py" --list-models
+     ```
+   - Ask the user to choose/complete the missing **model** and **reasoning effort** from the probed list. **NEVER auto-select a model/effort or fall back to `config.toml` defaults.**
+2. **Present Recommended Permissions in the Same Turn**:
+   - In the same message asking for model & reasoning effort (or confirming launch), list the task-mode-recommended safety permissions and state that Gemini will use them unless the user changes them:
+     - **`AUDIT`**: `-s read-only` (default)
+     - **`SURGICAL_FIX` / `FEATURE_IMPL`**: `-s workspace-write -a on-request` (default)
+   - **`danger-full-access` or `-a never` MUST ONLY be enabled when the user explicitly requests it.**
+3. **Launch Standalone Window & Auto-Bind UUID**:
+   ```bash
+   python "<SKILL_DIR>/scripts/start_codex_window.py" --cwd "<REPO_ROOT>" --model "<MODEL>" --effort "<EFFORT>" --sandbox "<SANDBOX>" [--approval "<APPROVAL>"] [--force-new] --timeout 25
+   ```
+   - `STATUS: STARTED_AND_BOUND` (`exit 0`): New window opened, UUID captured via `--since <launch_ts>` and saved to `.agent-collab/session.json`. Proceed directly to dispatch.
+   - `STATUS: START_TIMEOUT` (`exit 124`): Remind the user to check the newly opened Codex window (often paused on the first-time directory trust confirmation prompt), then rerun `find_codex_thread.py --cwd "<REPO_ROOT>" --refresh`.
+
+### Mid-Session Model / Config Switching (Two Preserved Modes)
+
+- **Mode 1 — In-Place Switch (No New Window)**: The user types `/model` or `/permissions` directly inside the right-hand Codex window. Because `codex queue --thread "<UUID>"` never passes model/effort override flags, the switch takes effect immediately while preserving full session context.
+- **Mode 2 — Reconfigure via Gemini (`--force-new`)**: When the user asks Gemini in the left window to switch model/effort/permissions, confirm explicit model & effort (calling `--list-models` if incomplete), launch an independent new window via `start_codex_window.py ... --force-new`, and overwrite `.agent-collab/session.json` with the new UUID. Leave the old window idle for the user to close manually (**NEVER force-kill the old process**).
+- **Context Freshness**: After merging a major feature and starting an unrelated module, remind the user they can either run `/new` + `hi` in the right window or ask Gemini to open a fresh window.
 
 ## 4. Dispatch Threshold, 3 Task Modes & Automated Wait
 
 - **`<= 10` lines** of intuitive config/typo tweak: Gemini edits directly — do NOT dispatch.
-- **Medium/large tasks**: Complete the Clarification Gate first, then present a 3–5 line confirmation (role split, contract summary, branch, task `Mode`) and get user approval.
+- **Medium/large tasks**: Complete the Clarification Gate first, then present a 3–5 line confirmation (role split, contract summary, branch, task `Mode`, and Codex window status/config) and get user approval.
 - Write `.agent-collab/contract.md` ([contract.template.md](./references/contract.template.md)) and `.agent-collab/task.md` ([task.template.md](./references/task.template.md)) with an explicit **`Mode`**:
   - `AUDIT`: Pure read-only investigation (`report.md` + `done.flag` only).
   - `SURGICAL_FIX`: Minimal allowlisted diff + regression test (no drive-by refactors).
