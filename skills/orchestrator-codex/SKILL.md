@@ -26,7 +26,7 @@ Gemini leads the workflow, owns the frontend and user-facing copy, and communica
 
 On Windows use `where.exe codex`. On Bash or Zsh use `type -a codex`. Check `codex --version` and `codex queue --help` on the selected CLI. Require `queue --resume`, local `-C`, and a daemon that supports queueing if using shared local app-server. For isolated desktops, verify `codex app-server daemon --help` and `codex app-server proxy --help`. Use the same resolved executable and `CODEX_HOME` for the launcher, the session store, and subsequent queue calls.
 
-Check that `.agent-collab/` is Git-ignored before creating project collaboration files. Use absolute project paths in commands. When overriding Codex home, pass the same `--codex-home` to the Python entry points and set that `CODEX_HOME` in the shell running Codex.
+Check that `.agent-collab/` is Git-ignored before creating project collaboration files. Use absolute project paths in commands. When overriding Codex home, pass the same `--codex-home` to `start_codex_window.py`, `find_codex_thread.py`, and `wait_codex_done.py --mode transcript`. Omit `--codex-home` for `wait_codex_done.py --clean` and flag-mode waits. Set the matching `CODEX_HOME` in the shell running Codex.
 
 ```bash
 python -B "<SKILL_DIR>/scripts/find_codex_thread.py" --cwd "<ABS_PROJECT_ROOT>"
@@ -50,7 +50,7 @@ For a new or resumed session, require the user's explicit model and reasoning ef
 python -B "<SKILL_DIR>/scripts/start_codex_window.py" --list-models
 ```
 
-| Task mode | Windows Default, macOS, Linux | Windows isolated `exebox-*` |
+| Task mode | Windows Default, macOS, Linux | Windows isolated `exebox-*` or `CodexSandboxDesktop-<32 hex digits>` |
 |---|---|---|
 | `AUDIT` | `--sandbox read-only` | `--sandbox read-only --approval never` |
 | `SURGICAL_FIX` or `FEATURE_IMPL` | `--sandbox workspace-write --approval on-request` | `--sandbox workspace-write --approval never` |

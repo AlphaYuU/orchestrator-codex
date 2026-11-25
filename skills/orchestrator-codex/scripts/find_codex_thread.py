@@ -422,23 +422,37 @@ def scan_matching_sessions(
 
 
 
-def session_by_uuid(directory: Path, thread_id: str, hint: str = "") -> Optional[Dict[str, Any]]:
-    def matching(files: Any) -> Optional[Dict[str, Any]]:
-        matches = []
-        for path in files:
-            record = parse_session_meta(path)
-            if record and record["thread_id"] == thread_id:
-                matches.append(record)
-        return max(matches, key=lambda item: item["mtime"], default=None)
+def rollout_path_for_uuid(directory: Path, thread_id: str, path: Path) -> Optional[Path]:
+    """Accept a target rollout path inside the supplied session store."""
+    resolved = path.resolve()
+    filename = resolved.name.lower()
+    suffix = f"{thread_id}.jsonl"
+    if directory.resolve() in resolved.parents and (filename == suffix or filename.endswith(f"-{suffix}")):
+        return resolved
+    return None
 
+
+def session_by_uuid(directory: Path, thread_id: str, hint: str = "") -> Optional[Dict[str, Any]]:
+    """Read metadata only from rollouts named for the requested UUID."""
+    thread_id = canonical_uuid(thread_id)
     if not directory.is_dir():
         return None
-    # The hint is a hint only. It must be inside the configured session store.
-    hinted = Path(hint).resolve() if hint else None
-    matches = list(directory.rglob(f"*{thread_id}*.jsonl"))
-    if hinted is not None and directory in hinted.parents and hinted not in matches:
-        matches.append(hinted)
-    return matching(matches) or matching(directory.rglob("rollout-*.jsonl"))
+
+    candidates = list(directory.rglob(f"*{thread_id}.jsonl"))
+    if hint:
+        candidates.append(Path(hint))
+
+    seen = set()
+    matches = []
+    for candidate in candidates:
+        path = rollout_path_for_uuid(directory, thread_id, candidate)
+        if path is None or path in seen:
+            continue
+        seen.add(path)
+        record = parse_session_meta(path)
+        if record and record["thread_id"] == thread_id:
+            matches.append(record)
+    return max(matches, key=lambda item: item["mtime"], default=None)
 
 
 def require_project_session(record: Optional[Dict[str, Any]], root: Path) -> Dict[str, Any]:

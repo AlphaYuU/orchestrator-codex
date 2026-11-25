@@ -60,7 +60,7 @@ class SessionContext:
 
 
 def detect_windows_desktop() -> str:
-    """Return the current Windows thread desktop name (e.g. 'Default' or 'exebox-...')."""
+    """Return the current Windows thread desktop name."""
     if os.name != "nt":
         return ""
     try:
@@ -225,7 +225,7 @@ def launch_mode(platform: str, desktop: str) -> str:
     name = desktop.lower()
     if name == "default":
         return MODE_VISIBLE_WINDOW
-    if re.fullmatch(r"exebox-[a-z0-9._-]+", name):
+    if re.fullmatch(r"exebox-[a-z0-9._-]+|codexsandboxdesktop-[0-9a-f]{32}", name):
         return MODE_DAEMON_MANAGED
     if not name:
         raise DesktopError("Windows desktop detection failed. Launch mode could not be determined.")

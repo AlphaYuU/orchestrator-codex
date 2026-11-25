@@ -18,7 +18,10 @@ from codex_session import (
     local_path, message_content, project_file, project_lock, resolve_project, task_marker,
     user_message,
 )
-from find_codex_thread import SessionOwnershipError, require_project_session, session_by_uuid
+from find_codex_thread import (
+    SessionOwnershipError, parse_session_meta, require_project_session, rollout_path_for_uuid,
+    session_by_uuid,
+)
 
 _REPORT_FIELD = re.compile(r"^\s*(?:[-*]\s*)?\**(Status|Task[ _]ID|Round)\**\s*:\**\s*(.*?)\s*$", re.I)
 _START_EVENTS = {"turn_started", "task_started"}
@@ -165,14 +168,21 @@ class TranscriptWatch:
             self.path = Path(require_project_session(meta, self.root)["session_file"])
             self.identity = None
         try:
-            with self.path.open("rb") as stream:
+            path = rollout_path_for_uuid(self.directory, self.thread, self.path)
+            if path is None:
+                raise SessionOwnershipError("The watched rollout path no longer matches the thread and session store.")
+            with path.open("rb") as stream:
                 stat = os.fstat(stream.fileno())
                 identity = stat.st_dev, stat.st_ino
                 if identity != self.identity or stat.st_size < self.offset:
+                    meta = parse_session_meta(path)
+                    if meta is None:
+                        return None  # A replacement rollout may still be writing its first line.
+                    if meta["thread_id"] != self.thread:
+                        raise SessionOwnershipError("The watched rollout has a different thread UUID.")
+                    require_project_session(meta, self.root)
                     self._reset()
                     self.identity = identity
-                    # Revalidate ownership after a rollout is atomically replaced.
-                    require_project_session(session_by_uuid(self.directory, self.thread), self.root)
                 stream.seek(self.offset)
                 while True:
                     raw = stream.readline()
