@@ -2,9 +2,12 @@
 """Auto-discover and cache the active Codex CLI thread UUID for a project root.
 
 Supports:
-- Cached binding lookup with SANDBOX_BACKGROUND live PID + name + creation-time fingerprint verification
-  (returns SANDBOX_SESSION_OFFLINE when background process has exited instead of returning stale CACHED).
-- --since <timestamp> creation-time filtering for capturing newly spawned windows.
+- Cached binding lookup with DAEMON_MANAGED liveness checks via `thread/loaded/list`
+  (returns DAEMON_SESSION_OFFLINE when stopped or unloaded, and handles pre-first-message
+  daemon threads before `rollout-*.jsonl` is created on disk).
+- Backward-compatible SANDBOX_BACKGROUND PID + name + creation-time fingerprint verification
+  (returns SANDBOX_SESSION_OFFLINE when legacy background process has exited).
+- --since <timestamp> creation-time filtering for capturing newly spawned visible windows.
 - --list-history for on-demand historical session selection prior to `start_codex_window.py --resume`.
 
 Zero third-party dependencies. Compatible with Python 3.8+ on Windows 11, macOS, and Linux.
@@ -37,6 +40,17 @@ HARNESS_TEXT_PREFIXES = (
 ALLOWED_PID_NAMES_WIN = frozenset(("conhost.exe", "powershell.exe", "codex.exe"))
 ALLOWED_PID_NAMES_POSIX = frozenset(("codex", "bash", "zsh", "sh"))
 MODE_SANDBOX_BACKGROUND = "SANDBOX_BACKGROUND"
+MODE_DAEMON_MANAGED = "DAEMON_MANAGED"
+
+_SCRIPT_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+
+try:
+    from codex_daemon_rpc import check_daemon_thread_loaded
+except ImportError:  # pragma: no cover
+    def check_daemon_thread_loaded(thread_id: str, timeout: float = 8.0) -> Tuple[bool, str, Dict[str, Any]]:
+        return False, "daemon_rpc_module_missing", {}
 
 _FILETIME_UNIX_EPOCH_TICKS = 11644473600 * 10_000_000
 _STILL_ACTIVE = 259
@@ -295,7 +309,7 @@ def read_cache(cache_path: Path, expected_norm_cwd: str) -> Optional[Dict[str, A
         return None
     thread_id = str(data.get("thread_id", "")).strip()
     mode = str(data.get("mode", "")).strip().upper()
-    if not thread_id and mode != MODE_SANDBOX_BACKGROUND:
+    if not thread_id and mode not in (MODE_SANDBOX_BACKGROUND, MODE_DAEMON_MANAGED):
         return None
     return data
 
@@ -319,6 +333,7 @@ def write_cache(cache_path: Path, record: Dict[str, Any]) -> None:
         "approval",
         "mode",
         "desktop",
+        "daemon_version",
         "pid",
         "pid_name",
         "pid_created_at",
@@ -326,6 +341,8 @@ def write_cache(cache_path: Path, record: Dict[str, Any]) -> None:
     ):
         if record.get(extra_key) not in (None, ""):
             payload[extra_key] = record[extra_key]
+    if record.get("stopped") is True:
+        payload["stopped"] = True
     cache_path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
@@ -885,7 +902,35 @@ def main() -> int:
         cached = read_cache(cache_path, target_norm_cwd)
         if cached:
             cached_mode = str(cached.get("mode") or "").strip().upper()
-            if cached_mode == MODE_SANDBOX_BACKGROUND:
+            if cached_mode == MODE_DAEMON_MANAGED:
+                cached_tid = str(cached.get("thread_id") or "").strip()
+                if cached.get("stopped") is True:
+                    ok_loaded, reason = False, "stopped_by_user"
+                else:
+                    ok_loaded, reason, _ = check_daemon_thread_loaded(cached_tid)
+                if not ok_loaded:
+                    emit_output(
+                        {
+                            "status": "DAEMON_SESSION_OFFLINE",
+                            "thread_id": cached_tid,
+                            "cwd": cached.get("cwd", resolved_cwd_display),
+                            "mode": MODE_DAEMON_MANAGED,
+                            "offline_reason": reason,
+                            "model": cached.get("model", ""),
+                            "reasoning_effort": cached.get("reasoning_effort", ""),
+                            "cache_file": str(cache_path),
+                            "note": (
+                                "Cached DAEMON_MANAGED Codex thread is not loaded in the local daemon. "
+                                "Do NOT proactively ask to resume history and do NOT dispatch to this offline thread; "
+                                "start a fresh session via start_codex_window.py (after user specifies model & effort), "
+                                "or resume ONLY if the user explicitly asks to continue history (--list-history + --resume)."
+                            ),
+                        },
+                        args.json,
+                    )
+                    return 3
+
+            elif cached_mode == MODE_SANDBOX_BACKGROUND:
                 ok_alive, reason = verify_managed_process(
                     cached.get("pid"),
                     str(cached.get("pid_name") or ""),
@@ -941,6 +986,36 @@ def main() -> int:
         since_ts=since_ts,
     )
     if not matches:
+        # Handle a live DAEMON_MANAGED thread created via thread/start before its first
+        # `codex queue` call materializes `rollout-*.jsonl` on disk.
+        if since_ts is None:
+            cached_daemon = read_cache(cache_path, target_norm_cwd)
+            if (
+                cached_daemon
+                and str(cached_daemon.get("mode") or "").strip().upper() == MODE_DAEMON_MANAGED
+                and cached_daemon.get("stopped") is not True
+                and cached_daemon.get("thread_id")
+            ):
+                ok_loaded, _, _ = check_daemon_thread_loaded(str(cached_daemon["thread_id"]))
+                if ok_loaded:
+                    emit_output(
+                        {
+                            "status": "CACHED",
+                            "thread_id": cached_daemon["thread_id"],
+                            "cwd": cached_daemon.get("cwd", resolved_cwd_display),
+                            "mode": MODE_DAEMON_MANAGED,
+                            "model": cached_daemon.get("model", ""),
+                            "reasoning_effort": cached_daemon.get("reasoning_effort", ""),
+                            "session_timestamp": cached_daemon.get("session_timestamp", ""),
+                            "cache_file": str(cache_path),
+                            "note": (
+                                "Thread is live in the managed daemon (rollout-*.jsonl will be "
+                                "created on disk when the first message is queued)."
+                            ),
+                        },
+                        args.json,
+                    )
+                    return 0
         note = (
             "No Codex session created since the requested --since timestamp matched this project root."
             if since_ts is not None

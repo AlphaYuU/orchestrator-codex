@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Launch, resume, or stop a Codex CLI Subagent window/session with explicit user-chosen
-model, reasoning effort, and permissions, plus anti-mis-kill PID fingerprint management.
+model, reasoning effort, and permissions.
 
-- Windows main desktop ('Default'): opens a visible standalone window via ShellExecuteW + wt.exe.
-- Windows isolated desktop (e.g. 'exebox-*'): runs safely in the background via explicit
-  conhost.exe powershell.exe (never triggering wt.exe / WindowsTerminal.exe).
+- Windows main desktop ('Default') / macOS / Linux: opens a visible standalone terminal
+  window (`VISIBLE_WINDOW` via ShellExecuteW + wt.exe on Windows).
+- Windows isolated sandbox desktop (e.g. 'exebox-*'): runs natively inside Codex's
+  persistent local app-server daemon (`DAEMON_MANAGED` via `codex app-server proxy`
+  JSON-RPC `thread/start`, `thread/resume`, `thread/loaded/list`, `thread/unsubscribe`),
+  spawning ZERO `wt.exe` / `conhost.exe` windows and surviving `run_command` exits.
 - Supports --list-models, --resume <UUID>, --stop, --force-new, and --dry-run.
 
 Zero third-party dependencies. Compatible with Python 3.8+ on Windows 11, macOS, and Linux.
@@ -40,7 +43,21 @@ ALLOWED_PID_NAMES_WIN = frozenset(("conhost.exe", "powershell.exe", "codex.exe")
 ALLOWED_PID_NAMES_POSIX = frozenset(("codex", "bash", "zsh", "sh"))
 
 MODE_VISIBLE_WINDOW = "VISIBLE_WINDOW"
+MODE_DAEMON_MANAGED = "DAEMON_MANAGED"
 MODE_SANDBOX_BACKGROUND = "SANDBOX_BACKGROUND"
+
+_SCRIPT_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+
+from codex_daemon_rpc import (  # noqa: E402
+    CodexDaemonClient,
+    DaemonRPCError,
+    DaemonUnavailableError,
+    check_daemon_thread_loaded,
+    ensure_daemon_running,
+    get_daemon_status,
+)
 
 _FILETIME_UNIX_EPOCH_TICKS = 11644473600 * 10_000_000
 _STILL_ACTIVE = 259
@@ -536,7 +553,8 @@ def emit_models_list(catalog: Dict[str, Any], as_json: bool) -> int:
     has_models = bool(models)
     status = "MODELS_LISTED" if has_models else "NO_MODELS_CACHE"
     desktop = detect_windows_desktop()
-    launch_mode = MODE_SANDBOX_BACKGROUND if is_isolated_windows_desktop(desktop) else MODE_VISIBLE_WINDOW
+    launch_mode = MODE_DAEMON_MANAGED if is_isolated_windows_desktop(desktop) else MODE_VISIBLE_WINDOW
+    daemon_info = get_daemon_status(timeout=4.0) if launch_mode == MODE_DAEMON_MANAGED else {}
 
     payload: Dict[str, Any] = {
         "status": status,
@@ -559,6 +577,9 @@ def emit_models_list(catalog: Dict[str, Any], as_json: bool) -> int:
             )
         ),
     }
+    if daemon_info:
+        payload["daemon_status"] = daemon_info.get("status", "")
+        payload["daemon_version"] = daemon_info.get("app_server_version", "")
     if catalog["models_cache_error"]:
         payload["error"] = catalog["models_cache_error"]
 
@@ -571,6 +592,9 @@ def emit_models_list(catalog: Dict[str, Any], as_json: bool) -> int:
     print(f"MODELS_CACHE: {catalog['models_cache_file']}")
     if desktop:
         print(f"DESKTOP: {desktop} (launch_mode={launch_mode})")
+    if daemon_info:
+        ver_bit = f" v{daemon_info['app_server_version']}" if daemon_info.get("app_server_version") else ""
+        print(f"DAEMON: {daemon_info.get('status', 'unknown')}{ver_bit}")
     if catalog["client_version"]:
         print(f"CLIENT_VERSION: {catalog['client_version']}")
     if catalog["fetched_at"]:
@@ -703,24 +727,25 @@ def build_launch_plan(
             model, effort, sandbox, approval, init_prompt, resume_uuid=resume_uuid
         )
 
-        # Isolated desktop (e.g. exebox-*): NEVER invoke wt.exe or bare powershell.exe
+        # Isolated sandbox desktop (e.g. exebox-*): host natively in Codex's persistent
+        # app-server daemon (ZERO wt.exe, ZERO conhost.exe, survives Job Object closure).
         if is_isolated_windows_desktop(desktop):
-            argv = [
-                "conhost.exe",
-                "powershell.exe",
-                "-NoExit",
-                "-Command",
-                ps_cmd,
-            ]
-            display = f'conhost.exe powershell.exe -NoExit -Command "{ps_cmd}"'
+            rpc_method = "thread/resume" if resume_uuid else "thread/start"
+            target_bit = f" threadId={resume_uuid}" if resume_uuid else ""
+            summary_cmd = (
+                f"codex app-server proxy -> {rpc_method}"
+                f"{target_bit} model={model} effort={effort}"
+                f" sandbox={sandbox or 'default'} approval={approval or 'default'}"
+            )
             return {
                 "platform": "windows",
                 "desktop": desktop,
-                "mode": MODE_SANDBOX_BACKGROUND,
-                "launcher": "conhost.exe",
-                "codex_cmd": ps_cmd,
-                "launch_argv": argv,
-                "launch_cmd_display": display,
+                "mode": MODE_DAEMON_MANAGED,
+                "launcher": "app-server-daemon",
+                "rpc_method": rpc_method,
+                "codex_cmd": summary_cmd,
+                "launch_argv": ["codex", "app-server", "proxy"],
+                "launch_cmd_display": summary_cmd,
             }
 
         # Main desktop ('Default' or unknown): visible standalone window via wt.exe
@@ -944,6 +969,26 @@ def clear_cache_pid_fields(cache_path: Path) -> None:
         pass
 
 
+def mark_daemon_session_stopped(cache_path: Path) -> None:
+    if not safe_is_file(cache_path):
+        return
+    try:
+        loaded = json.loads(cache_path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(loaded, dict):
+        return
+    loaded["stopped"] = True
+    loaded["updated_at"] = utc_now_iso()
+    try:
+        cache_path.write_text(
+            json.dumps(loaded, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
 def update_cache_launch_metadata(
     cache_path: Path,
     thread_id: str,
@@ -957,6 +1002,7 @@ def update_cache_launch_metadata(
     proc_ident: Optional[Dict[str, Any]] = None,
     session_file: str = "",
     session_timestamp: str = "",
+    daemon_version: str = "",
 ) -> None:
     existing: Dict[str, Any] = {}
     if safe_is_file(cache_path):
@@ -988,8 +1034,13 @@ def update_cache_launch_metadata(
         existing["desktop"] = desktop
     else:
         existing.pop("desktop", None)
+    if daemon_version:
+        existing["daemon_version"] = daemon_version
+    elif mode != MODE_DAEMON_MANAGED:
+        existing.pop("daemon_version", None)
+    existing.pop("stopped", None)
 
-    if proc_ident and proc_ident.get("pid"):
+    if mode != MODE_DAEMON_MANAGED and proc_ident and proc_ident.get("pid"):
         existing["pid"] = int(proc_ident["pid"])
         existing["pid_name"] = str(proc_ident.get("pid_name") or "")
         existing["pid_created_at"] = str(proc_ident.get("pid_created_at") or "")
@@ -1051,8 +1102,17 @@ def stop_cached_session(
     cache_path: Path,
     expected_norm_cwd: str,
     only_sandbox_background: bool = False,
+    skip_thread_id: str = "",
 ) -> Dict[str, Any]:
-    """Safely stop the managed process recorded in .agent-collab/session.json."""
+    """Safely stop the managed session recorded in .agent-collab/session.json.
+
+    - DAEMON_MANAGED: gracefully interrupts any active turn and unsubscribes ONLY
+      this project's thread via `thread/unsubscribe` (never stops the shared daemon
+      and never kills any OS processes).
+    - SANDBOX_BACKGROUND (legacy): terminates ONLY after verifying PID + process name +
+      creation-time fingerprint.
+    - VISIBLE_WINDOW: untouched during reconfigure cleanup (left for user to close).
+    """
     cached = read_existing_cache(cache_path, expected_norm_cwd)
     if not cached:
         return {
@@ -1062,13 +1122,68 @@ def stop_cached_session(
         }
 
     mode = str(cached.get("mode") or "").upper()
+    cached_tid = str(cached.get("thread_id") or "").strip()
+
+    if mode == MODE_DAEMON_MANAGED:
+        if skip_thread_id and cached_tid == skip_thread_id:
+            return {
+                "status": "SKIPPED_SAME_THREAD",
+                "thread_id": cached_tid,
+                "mode": mode,
+                "cache_file": str(cache_path),
+                "note": "Target resume UUID matches cached DAEMON_MANAGED thread; keeping active binding.",
+            }
+        if not cached_tid:
+            mark_daemon_session_stopped(cache_path)
+            return {
+                "status": "ALREADY_EXITED",
+                "mode": mode,
+                "cache_file": str(cache_path),
+                "note": "No thread_id recorded in cached DAEMON_MANAGED session.",
+            }
+        daemon_info = get_daemon_status(timeout=5.0)
+        if not daemon_info.get("running"):
+            mark_daemon_session_stopped(cache_path)
+            return {
+                "status": "ALREADY_EXITED",
+                "thread_id": cached_tid,
+                "mode": mode,
+                "cache_file": str(cache_path),
+                "note": "Managed Codex daemon is not running; marked cached thread as stopped.",
+            }
+        try:
+            with CodexDaemonClient(timeout=10.0, socket_path=daemon_info.get("socket_path", "")) as client:
+                interrupted = client.interrupt_active_turn(cached_tid)
+                unsub_res = client.unsubscribe_thread(cached_tid)
+                unsub_status = str(unsub_res.get("status") or "unsubscribed")
+        except DaemonRPCError as exc:
+            return {
+                "status": "STOP_FAILED",
+                "thread_id": cached_tid,
+                "mode": mode,
+                "cache_file": str(cache_path),
+                "note": f"Failed to unsubscribe daemon thread {cached_tid}: {exc}",
+            }
+        mark_daemon_session_stopped(cache_path)
+        return {
+            "status": "STOPPED",
+            "thread_id": cached_tid,
+            "mode": mode,
+            "unsubscribe_status": unsub_status,
+            "cache_file": str(cache_path),
+            "note": (
+                f"Gracefully unsubscribed daemon thread {cached_tid} (status={unsub_status}, "
+                f"turn_interrupted={interrupted}). Shared daemon left running."
+            ),
+        }
+
     if only_sandbox_background and mode != MODE_SANDBOX_BACKGROUND:
         return {
             "status": "SKIPPED_VISIBLE_WINDOW",
-            "thread_id": cached.get("thread_id", ""),
+            "thread_id": cached_tid,
             "mode": mode,
             "cache_file": str(cache_path),
-            "note": "Existing session is not SANDBOX_BACKGROUND; leaving visible window untouched.",
+            "note": "Existing session is VISIBLE_WINDOW; leaving visible window untouched.",
         }
 
     raw_pid = cached.get("pid")
@@ -1314,6 +1429,8 @@ def emit_result(data: Dict[str, Any], as_json: bool) -> None:
         ("desktop", "DESKTOP"),
         ("mode", "MODE"),
         ("launcher", "LAUNCHER"),
+        ("daemon_version", "DAEMON_VERSION"),
+        ("unsubscribe_status", "UNSUBSCRIBE_STATUS"),
         ("pid", "PID"),
         ("pid_name", "PID_NAME"),
         ("pid_created_at", "PID_CREATED_AT"),
@@ -1533,17 +1650,6 @@ def main() -> int:
     )
     sessions_dir_arg = args.sessions_dir or (str(sessions_dir_path) if args.codex_home else "")
 
-    resumed_meta: Optional[Dict[str, Any]] = None
-    if resume_uuid:
-        resumed_meta = locate_session_jsonl(sessions_dir_path, resume_uuid)
-        if not resumed_meta:
-            print(
-                f"ERROR: Historical session log (.jsonl) for UUID '{resume_uuid}' was not found under {sessions_dir_path}. "
-                "Run `find_codex_thread.py --cwd \"<REPO_ROOT>\" --list-history` to inspect valid session UUIDs.",
-                file=sys.stderr,
-            )
-            return 2
-
     plan = build_launch_plan(
         cwd=resolved_cwd,
         model=model,
@@ -1553,6 +1659,28 @@ def main() -> int:
         init_prompt=args.init_prompt,
         resume_uuid=resume_uuid,
     )
+
+    resumed_meta: Optional[Dict[str, Any]] = None
+    if resume_uuid:
+        resumed_meta = locate_session_jsonl(sessions_dir_path, resume_uuid)
+        if not resumed_meta and plan["mode"] == MODE_DAEMON_MANAGED:
+            # Handle a DAEMON_MANAGED thread created via thread/start before its first
+            # `codex queue` call materializes `rollout-*.jsonl` on disk.
+            loaded_in_daemon, _, _ = check_daemon_thread_loaded(resume_uuid, timeout=6.0)
+            if loaded_in_daemon:
+                resumed_meta = {
+                    "thread_id": resume_uuid,
+                    "cwd": resolved_cwd,
+                    "session_file": "",
+                    "session_timestamp": "",
+                }
+        if not resumed_meta:
+            print(
+                f"ERROR: Historical session log (.jsonl) for UUID '{resume_uuid}' was not found under {sessions_dir_path}. "
+                "Run `find_codex_thread.py --cwd \"<REPO_ROOT>\" --list-history` to inspect valid session UUIDs.",
+                file=sys.stderr,
+            )
+            return 2
 
     if not plan["launch_argv"]:
         print(
@@ -1592,7 +1720,12 @@ def main() -> int:
         if existing:
             existing_mode = str(existing.get("mode") or "").upper()
             still_usable = True
-            if existing_mode == MODE_SANDBOX_BACKGROUND:
+            if existing_mode == MODE_DAEMON_MANAGED:
+                if existing.get("stopped") is True:
+                    still_usable = False
+                else:
+                    still_usable, _, _ = check_daemon_thread_loaded(str(existing.get("thread_id") or ""))
+            elif existing_mode == MODE_SANDBOX_BACKGROUND:
                 ok_alive, _, _ = verify_managed_process(
                     existing.get("pid"),
                     str(existing.get("pid_name") or ""),
@@ -1606,6 +1739,7 @@ def main() -> int:
                         "thread_id": existing["thread_id"],
                         "cwd": existing.get("cwd", resolved_cwd),
                         "mode": existing_mode or MODE_VISIBLE_WINDOW,
+                        "daemon_version": existing.get("daemon_version", ""),
                         "pid": existing.get("pid"),
                         "pid_name": existing.get("pid_name", ""),
                         "pid_created_at": existing.get("pid_created_at", ""),
@@ -1621,17 +1755,192 @@ def main() -> int:
                 )
                 return 0
 
-    # Safe pre-launch cleanup of any previously alive SANDBOX_BACKGROUND process
+    # Safe pre-launch cleanup of any previously alive background/daemon session
     cleanup_status = ""
     if args.force_new or resume_uuid:
-        cleanup = stop_cached_session(cache_path, target_norm_cwd, only_sandbox_background=True)
+        cleanup = stop_cached_session(
+            cache_path,
+            target_norm_cwd,
+            only_sandbox_background=True,
+            skip_thread_id=resume_uuid,
+        )
         cleanup_status = cleanup.get("status", "")
         if cleanup_status == "STOP_FAILED":
             print(f"WARNING: Failed to stop previous background Codex: {cleanup.get('note')}", file=sys.stderr)
 
+    start_mono = time.monotonic()
+
+    # Native DAEMON_MANAGED branch (isolated sandbox desktop: zero terminal windows, zero PID killing)
+    if plan["mode"] == MODE_DAEMON_MANAGED:
+        try:
+            daemon_info = ensure_daemon_running(timeout=min(max(args.timeout, 5.0), 15.0))
+        except DaemonUnavailableError as exc:
+            elapsed = round(time.monotonic() - start_mono, 1)
+            emit_result(
+                {
+                    "status": "DAEMON_UNAVAILABLE",
+                    "thread_id": resume_uuid,
+                    "cwd": resolved_cwd,
+                    "platform": plan["platform"],
+                    "desktop": plan.get("desktop", ""),
+                    "mode": MODE_DAEMON_MANAGED,
+                    "launcher": plan["launcher"],
+                    "model": model,
+                    "effort": effort,
+                    "sandbox": args.sandbox,
+                    "approval": args.approval,
+                    "cache_file": str(cache_path),
+                    "elapsed_sec": elapsed,
+                    "note": str(exc),
+                    "hint": exc.hint,
+                },
+                args.json,
+            )
+            return 1
+
+        try:
+            with CodexDaemonClient(
+                timeout=max(10.0, args.timeout),
+                socket_path=daemon_info.get("socket_path", ""),
+            ) as client:
+                if resume_uuid:
+                    rpc_info = client.resume_thread(
+                        thread_id=resume_uuid,
+                        cwd=resolved_cwd,
+                        model=model,
+                        effort=effort,
+                        sandbox=args.sandbox,
+                        approval=args.approval,
+                        exclude_turns=True,
+                    )
+                    target_tid = rpc_info["thread_id"]
+                    loaded = client.list_loaded_threads()
+                    if target_tid not in loaded:
+                        raise DaemonRPCError(
+                            f"Thread {target_tid} was not present in thread/loaded/list after thread/resume."
+                        )
+                    elapsed = round(time.monotonic() - start_mono, 1)
+                    update_cache_launch_metadata(
+                        cache_path=cache_path,
+                        thread_id=target_tid,
+                        cwd=resolved_cwd,
+                        model=model,
+                        effort=effort,
+                        sandbox=args.sandbox,
+                        approval=args.approval,
+                        mode=MODE_DAEMON_MANAGED,
+                        desktop=plan.get("desktop", ""),
+                        session_file=rpc_info.get("session_file") or (resumed_meta["session_file"] if resumed_meta else ""),
+                        session_timestamp=resumed_meta["session_timestamp"] if resumed_meta else "",
+                        daemon_version=daemon_info.get("app_server_version", ""),
+                    )
+                    emit_result(
+                        {
+                            "status": "RESUMED_AND_BOUND",
+                            "thread_id": target_tid,
+                            "cwd": resolved_cwd,
+                            "platform": plan["platform"],
+                            "desktop": plan.get("desktop", ""),
+                            "mode": MODE_DAEMON_MANAGED,
+                            "launcher": plan["launcher"],
+                            "daemon_version": daemon_info.get("app_server_version", ""),
+                            "model": rpc_info.get("model") or model,
+                            "effort": rpc_info.get("reasoning_effort") or effort,
+                            "sandbox": args.sandbox,
+                            "approval": args.approval,
+                            "codex_cmd": plan["codex_cmd"],
+                            "launch_cmd": plan["launch_cmd_display"],
+                            "cache_file": str(cache_path),
+                            "elapsed_sec": elapsed,
+                            "cleanup_status": cleanup_status,
+                            "note": "Resumed thread natively in managed Codex daemon (excludeTurns=true; history preserved).",
+                        },
+                        args.json,
+                    )
+                    return 0
+
+                rpc_info = client.start_thread(
+                    cwd=resolved_cwd,
+                    model=model,
+                    effort=effort,
+                    sandbox=args.sandbox,
+                    approval=args.approval,
+                )
+                new_tid = rpc_info["thread_id"]
+                loaded = client.list_loaded_threads()
+                if new_tid not in loaded:
+                    raise DaemonRPCError(
+                        f"Thread {new_tid} was not present in thread/loaded/list after thread/start."
+                    )
+        except DaemonRPCError as exc:
+            elapsed = round(time.monotonic() - start_mono, 1)
+            emit_result(
+                {
+                    "status": "DAEMON_RPC_ERROR",
+                    "thread_id": resume_uuid,
+                    "cwd": resolved_cwd,
+                    "platform": plan["platform"],
+                    "desktop": plan.get("desktop", ""),
+                    "mode": MODE_DAEMON_MANAGED,
+                    "launcher": plan["launcher"],
+                    "daemon_version": daemon_info.get("app_server_version", ""),
+                    "model": model,
+                    "effort": effort,
+                    "sandbox": args.sandbox,
+                    "approval": args.approval,
+                    "cache_file": str(cache_path),
+                    "elapsed_sec": elapsed,
+                    "note": str(exc),
+                },
+                args.json,
+            )
+            return 1
+
+        elapsed = round(time.monotonic() - start_mono, 1)
+        update_cache_launch_metadata(
+            cache_path=cache_path,
+            thread_id=new_tid,
+            cwd=resolved_cwd,
+            model=model,
+            effort=effort,
+            sandbox=args.sandbox,
+            approval=args.approval,
+            mode=MODE_DAEMON_MANAGED,
+            desktop=plan.get("desktop", ""),
+            session_file=rpc_info.get("session_file", ""),
+            session_timestamp=utc_now_iso(),
+            daemon_version=daemon_info.get("app_server_version", ""),
+        )
+        emit_result(
+            {
+                "status": "STARTED_AND_BOUND",
+                "thread_id": new_tid,
+                "cwd": resolved_cwd,
+                "platform": plan["platform"],
+                "desktop": plan.get("desktop", ""),
+                "mode": MODE_DAEMON_MANAGED,
+                "launcher": plan["launcher"],
+                "daemon_version": daemon_info.get("app_server_version", ""),
+                "model": rpc_info.get("model") or model,
+                "effort": rpc_info.get("reasoning_effort") or effort,
+                "sandbox": args.sandbox,
+                "approval": args.approval,
+                "codex_cmd": plan["codex_cmd"],
+                "launch_cmd": plan["launch_cmd_display"],
+                "cache_file": str(cache_path),
+                "elapsed_sec": elapsed,
+                "cleanup_status": cleanup_status,
+                "note": (
+                    "Created thread natively in managed Codex daemon (0 terminal windows spawned; "
+                    "rollout-*.jsonl will materialize on disk when the first message is queued)."
+                ),
+            },
+            args.json,
+        )
+        return 0
+
     launch_ts = time.time()
     launch_ft = now_windows_filetime()
-    start_mono = time.monotonic()
 
     launcher_proc: Optional[subprocess.Popen[Any]] = None
     managed_ident: Optional[Dict[str, Any]] = None
