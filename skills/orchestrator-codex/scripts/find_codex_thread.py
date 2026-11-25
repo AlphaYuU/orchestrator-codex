@@ -1,16 +1,24 @@
 #!/usr/bin/env python3
 """Auto-discover and cache the active Codex CLI thread UUID for a project root.
 
+Supports:
+- Cached binding lookup with SANDBOX_BACKGROUND live PID + name + creation-time fingerprint verification
+  (returns SANDBOX_SESSION_OFFLINE when background process has exited instead of returning stale CACHED).
+- --since <timestamp> creation-time filtering for capturing newly spawned windows.
+- --list-history for on-demand historical session selection prior to `start_codex_window.py --resume`.
+
 Zero third-party dependencies. Compatible with Python 3.8+ on Windows 11, macOS, and Linux.
 """
 
 from __future__ import annotations
 
 import argparse
+import ctypes
 import datetime as dt
 import json
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -25,6 +33,14 @@ HARNESS_TEXT_PREFIXES = (
     "<skills_instructions>",
     "<turn_aborted>",
 )
+
+ALLOWED_PID_NAMES_WIN = frozenset(("conhost.exe", "powershell.exe", "codex.exe"))
+ALLOWED_PID_NAMES_POSIX = frozenset(("codex", "bash", "zsh", "sh"))
+MODE_SANDBOX_BACKGROUND = "SANDBOX_BACKGROUND"
+
+_FILETIME_UNIX_EPOCH_TICKS = 11644473600 * 10_000_000
+_STILL_ACTIVE = 259
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 
 
 def configure_utf8_stdio() -> None:
@@ -82,6 +98,143 @@ def format_mtime_local(mtime: float) -> str:
     return dt.datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def filetime_to_iso_utc(filetime_ticks: int) -> str:
+    """Lossless 100ns UTC ISO-8601 fingerprint from Win32 FILETIME."""
+    unix_100ns = filetime_ticks - _FILETIME_UNIX_EPOCH_TICKS
+    if unix_100ns < 0:
+        return f"ft:{filetime_ticks}"
+    secs, rem_100ns = divmod(unix_100ns, 10_000_000)
+    base = dt.datetime.fromtimestamp(secs, tz=dt.timezone.utc)
+    return f"{base.strftime('%Y-%m-%dT%H:%M:%S')}.{rem_100ns:07d}Z"
+
+
+def get_process_identity(pid: int) -> Optional[Dict[str, Any]]:
+    """Query live process identity (pid, pid_name, pid_created_at)."""
+    if not isinstance(pid, int) or pid <= 0:
+        return None
+
+    if os.name == "nt":
+        try:
+            import ctypes.wintypes as wt
+
+            k32 = ctypes.windll.kernel32
+            k32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+            k32.OpenProcess.restype = wt.HANDLE
+            k32.GetExitCodeProcess.argtypes = [wt.HANDLE, ctypes.POINTER(wt.DWORD)]
+            k32.GetExitCodeProcess.restype = wt.BOOL
+            k32.GetProcessTimes.argtypes = [
+                wt.HANDLE,
+                ctypes.POINTER(wt.FILETIME),
+                ctypes.POINTER(wt.FILETIME),
+                ctypes.POINTER(wt.FILETIME),
+                ctypes.POINTER(wt.FILETIME),
+            ]
+            k32.GetProcessTimes.restype = wt.BOOL
+            k32.QueryFullProcessImageNameW.argtypes = [
+                wt.HANDLE,
+                wt.DWORD,
+                wt.LPWSTR,
+                ctypes.POINTER(wt.DWORD),
+            ]
+            k32.QueryFullProcessImageNameW.restype = wt.BOOL
+            k32.CloseHandle.argtypes = [wt.HANDLE]
+            k32.CloseHandle.restype = wt.BOOL
+
+            hproc = k32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not hproc:
+                return None
+            try:
+                exit_code = wt.DWORD(0)
+                if not k32.GetExitCodeProcess(hproc, ctypes.byref(exit_code)):
+                    return None
+                if exit_code.value != _STILL_ACTIVE:
+                    return None
+
+                ct, et, kt, ut = wt.FILETIME(), wt.FILETIME(), wt.FILETIME(), wt.FILETIME()
+                if not k32.GetProcessTimes(
+                    hproc, ctypes.byref(ct), ctypes.byref(et), ctypes.byref(kt), ctypes.byref(ut)
+                ):
+                    return None
+                ft_ticks = (ct.dwHighDateTime << 32) | ct.dwLowDateTime
+
+                nlen = wt.DWORD(1024)
+                nbuf = ctypes.create_unicode_buffer(1024)
+                if not k32.QueryFullProcessImageNameW(hproc, 0, nbuf, ctypes.byref(nlen)):
+                    return None
+                exe_name = os.path.basename(nbuf.value).strip()
+                if not exe_name:
+                    return None
+
+                return {
+                    "pid": pid,
+                    "pid_name": exe_name,
+                    "pid_created_at": filetime_to_iso_utc(ft_ticks),
+                }
+            finally:
+                k32.CloseHandle(hproc)
+        except (AttributeError, OSError, ValueError):
+            return None
+
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return None
+    try:
+        proc = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "comm=,lstart="],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        line = proc.stdout.strip()
+        if not line:
+            return None
+        parts = line.split(None, 1)
+        comm = os.path.basename(parts[0]).strip()
+        lstart = parts[1].strip() if len(parts) > 1 else ""
+        return {
+            "pid": pid,
+            "pid_name": comm,
+            "pid_created_at": lstart,
+        }
+    except OSError:
+        return None
+
+
+def verify_managed_process(
+    pid: Any,
+    expected_name: str,
+    expected_created_at: str,
+) -> Tuple[bool, str]:
+    """Strictly verify PID + allowlisted process name + creation-time fingerprint."""
+    try:
+        pid_int = int(pid)
+    except (TypeError, ValueError):
+        return False, "invalid_or_missing_pid"
+    if pid_int <= 0:
+        return False, "invalid_or_missing_pid"
+
+    exp_name = str(expected_name or "").strip().lower()
+    exp_created = str(expected_created_at or "").strip()
+    allowed = ALLOWED_PID_NAMES_WIN if os.name == "nt" else ALLOWED_PID_NAMES_POSIX
+    if not exp_name or exp_name not in allowed:
+        return False, "disallowed_pid_name"
+    if not exp_created:
+        return False, "missing_pid_created_at"
+
+    live = get_process_identity(pid_int)
+    if not live:
+        return False, "process_not_running"
+
+    live_name = str(live.get("pid_name") or "").strip().lower()
+    live_created = str(live.get("pid_created_at") or "").strip()
+    if live_name not in allowed or live_name != exp_name:
+        return False, "pid_name_mismatch"
+    if live_created != exp_created:
+        return False, "pid_created_at_mismatch"
+    return True, "verified_alive"
+
+
 def parse_timestamp(value: Any) -> Optional[float]:
     """Parse Unix epoch seconds (int/float/str) or ISO-8601 string (Python 3.8+ safe)."""
     if value is None:
@@ -137,11 +290,12 @@ def read_cache(cache_path: Path, expected_norm_cwd: str) -> Optional[Dict[str, A
         return None
     if not isinstance(data, dict):
         return None
-    thread_id = str(data.get("thread_id", "")).strip()
     cached_cwd = str(data.get("cwd", "")).strip()
-    if not thread_id:
-        return None
     if cached_cwd and normalize_path(cached_cwd) != expected_norm_cwd:
+        return None
+    thread_id = str(data.get("thread_id", "")).strip()
+    mode = str(data.get("mode", "")).strip().upper()
+    if not thread_id and mode != MODE_SANDBOX_BACKGROUND:
         return None
     return data
 
@@ -158,8 +312,19 @@ def write_cache(cache_path: Path, record: Dict[str, Any]) -> None:
         "branch": record.get("branch", ""),
         "updated_at": utc_now_iso(),
     }
-    for extra_key in ("model", "reasoning_effort", "sandbox", "approval", "launched_by"):
-        if record.get(extra_key):
+    for extra_key in (
+        "model",
+        "reasoning_effort",
+        "sandbox",
+        "approval",
+        "mode",
+        "desktop",
+        "pid",
+        "pid_name",
+        "pid_created_at",
+        "launched_by",
+    ):
+        if record.get(extra_key) not in (None, ""):
             payload[extra_key] = record[extra_key]
     cache_path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
@@ -484,6 +649,22 @@ def scan_matching_sessions(
     return matches
 
 
+def serialize_candidate(m: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "thread_id": m["thread_id"],
+        "short_id": m["thread_id"][:8],
+        "model": m.get("model", ""),
+        "reasoning_effort": m.get("reasoning_effort", ""),
+        "last_active_local": m["last_active_local"],
+        "session_timestamp": m["session_timestamp"],
+        "first_user_message": m.get("first_user_message", ""),
+        "branch": m["branch"],
+        "originator": m["originator"],
+        "source": m["source"],
+        "session_file": m.get("session_file", ""),
+    }
+
+
 def emit_output(data: Dict[str, Any], as_json: bool) -> None:
     if as_json:
         print(json.dumps(data, ensure_ascii=False, indent=2))
@@ -495,6 +676,14 @@ def emit_output(data: Dict[str, Any], as_json: bool) -> None:
         print(f"THREAD_ID: {data['thread_id']}")
     if data.get("cwd"):
         print(f"CWD: {data['cwd']}")
+    if data.get("mode"):
+        print(f"MODE: {data['mode']}")
+    if data.get("pid") not in (None, ""):
+        print(f"PID: {data['pid']}")
+    if data.get("pid_name"):
+        print(f"PID_NAME: {data['pid_name']}")
+    if data.get("offline_reason"):
+        print(f"OFFLINE_REASON: {data['offline_reason']}")
     if data.get("model"):
         print(f"MODEL: {data['model']}")
     if data.get("reasoning_effort"):
@@ -508,17 +697,17 @@ def emit_output(data: Dict[str, Any], as_json: bool) -> None:
     if data.get("note"):
         print(f"NOTE: {data['note']}")
 
-    candidates = data.get("candidates") or []
-    if candidates:
-        print("CANDIDATES:")
-        for idx, item in enumerate(candidates, start=1):
+    entries = data.get("history") or data.get("candidates") or []
+    if entries:
+        header = "HISTORY:" if data.get("history") else "CANDIDATES:"
+        print(header)
+        for idx, item in enumerate(entries, start=1):
             short_id = item.get("short_id") or item["thread_id"][:8]
             meta_bits = []
             model_val = item.get("model") or "unknown"
-            if item.get("reasoning_effort"):
-                meta_bits.append(f"model={model_val}({item['reasoning_effort']})")
-            else:
-                meta_bits.append(f"model={model_val}")
+            effort_val = item.get("reasoning_effort") or "unknown"
+            meta_bits.append(f"model={model_val}")
+            meta_bits.append(f"effort={effort_val}")
             if item.get("last_active_local"):
                 meta_bits.append(f"active={item['last_active_local']}")
             if item.get("first_user_message"):
@@ -550,6 +739,11 @@ def main() -> int:
         help="Pin a specific thread UUID into .agent-collab/session.json.",
     )
     parser.add_argument(
+        "--list-history",
+        action="store_true",
+        help="List all historical Codex sessions for --cwd (for on-demand --resume selection).",
+    )
+    parser.add_argument(
         "--since",
         default="",
         help="Only match sessions created at or after this Unix epoch or ISO-8601 timestamp.",
@@ -573,8 +767,8 @@ def main() -> int:
     parser.add_argument(
         "--limit",
         type=int,
-        default=5,
-        help="Maximum numbered candidates to show when multiple sessions match (default: 5).",
+        default=0,
+        help="Maximum items to show (default: 5 for MULTIPLE_MATCHES, 10 for --list-history).",
     )
     parser.add_argument(
         "--include-subagents",
@@ -615,6 +809,43 @@ def main() -> int:
         Path(args.sessions_dir).expanduser() if args.sessions_dir else default_sessions_dir()
     )
 
+    if args.list_history:
+        history_matches = scan_matching_sessions(
+            sessions_dir,
+            target_norm_cwd,
+            include_subagents=args.include_subagents,
+            since_ts=since_ts,
+        )
+        if not history_matches:
+            emit_output(
+                {
+                    "status": "NOT_FOUND",
+                    "cwd": resolved_cwd_display,
+                    "sessions_dir": str(sessions_dir),
+                    "note": "No historical Codex sessions found for this project root.",
+                },
+                args.json,
+            )
+            return 1
+
+        max_items = args.limit if args.limit > 0 else 10
+        enriched = [enrich_session(m) for m in history_matches[:max_items]]
+        emit_output(
+            {
+                "status": "HISTORY_LISTED",
+                "cwd": resolved_cwd_display,
+                "total": len(history_matches),
+                "history": [serialize_candidate(m) for m in enriched],
+                "note": (
+                    "Present these historical sessions to the user ONLY when they explicitly asked to resume. "
+                    "After the user selects one and specifies model & effort, launch via "
+                    "start_codex_window.py --resume <UUID>."
+                ),
+            },
+            args.json,
+        )
+        return 0
+
     if args.select:
         selected_id = args.select.strip()
         matched_meta = None
@@ -653,19 +884,55 @@ def main() -> int:
     if not args.refresh and since_ts is None:
         cached = read_cache(cache_path, target_norm_cwd)
         if cached:
-            emit_output(
-                {
-                    "status": "CACHED",
-                    "thread_id": cached["thread_id"],
-                    "cwd": cached.get("cwd", resolved_cwd_display),
-                    "model": cached.get("model", ""),
-                    "reasoning_effort": cached.get("reasoning_effort", ""),
-                    "session_timestamp": cached.get("session_timestamp", ""),
-                    "cache_file": str(cache_path),
-                },
-                args.json,
-            )
-            return 0
+            cached_mode = str(cached.get("mode") or "").strip().upper()
+            if cached_mode == MODE_SANDBOX_BACKGROUND:
+                ok_alive, reason = verify_managed_process(
+                    cached.get("pid"),
+                    str(cached.get("pid_name") or ""),
+                    str(cached.get("pid_created_at") or ""),
+                )
+                if not ok_alive:
+                    # Strictly report offline; NEVER return CACHED or fall back to AUTO_SELECTED
+                    emit_output(
+                        {
+                            "status": "SANDBOX_SESSION_OFFLINE",
+                            "thread_id": cached.get("thread_id", ""),
+                            "cwd": cached.get("cwd", resolved_cwd_display),
+                            "mode": MODE_SANDBOX_BACKGROUND,
+                            "pid": cached.get("pid"),
+                            "pid_name": cached.get("pid_name", ""),
+                            "offline_reason": reason,
+                            "model": cached.get("model", ""),
+                            "reasoning_effort": cached.get("reasoning_effort", ""),
+                            "cache_file": str(cache_path),
+                            "note": (
+                                "Cached SANDBOX_BACKGROUND Codex process is offline or PID fingerprint mismatch. "
+                                "Do NOT dispatch to this offline thread and do NOT auto-select stale logs; "
+                                "start a fresh session via start_codex_window.py (after user specifies model & effort), "
+                                "or resume only if the user explicitly asks to continue history."
+                            ),
+                        },
+                        args.json,
+                    )
+                    return 3
+
+            if cached.get("thread_id"):
+                emit_output(
+                    {
+                        "status": "CACHED",
+                        "thread_id": cached["thread_id"],
+                        "cwd": cached.get("cwd", resolved_cwd_display),
+                        "mode": cached_mode,
+                        "pid": cached.get("pid"),
+                        "pid_name": cached.get("pid_name", ""),
+                        "model": cached.get("model", ""),
+                        "reasoning_effort": cached.get("reasoning_effort", ""),
+                        "session_timestamp": cached.get("session_timestamp", ""),
+                        "cache_file": str(cache_path),
+                    },
+                    args.json,
+                )
+                return 0
 
     matches = scan_matching_sessions(
         sessions_dir,
@@ -678,9 +945,8 @@ def main() -> int:
             "No Codex session created since the requested --since timestamp matched this project root."
             if since_ts is not None
             else (
-                "No Codex session matched this project root. Launch a new Codex window via "
-                "start_codex_window.py (after confirming model & effort with the user), or open Codex CLI "
-                "manually in this directory, send 'hi', and rerun with --refresh."
+                "No Codex session matched this project root. Launch a new Codex session via "
+                "start_codex_window.py (after confirming model & effort with the user)."
             )
         )
         emit_output(
@@ -738,37 +1004,24 @@ def main() -> int:
                 "cache_file": str(cache_path),
                 "note": (
                     f"Only matching session is older than {args.recent_hours:g}h. "
-                    "Consider running '/new' + 'hi' in the Codex window or opening a new window."
+                    "Consider running '/new' + 'hi' in the Codex window or opening a new session."
                 ),
             },
             args.json,
         )
         return 0
 
-    limited = [enrich_session(m) for m in pool[: max(1, args.limit)]]
+    max_candidates = args.limit if args.limit > 0 else 5
+    limited = [enrich_session(m) for m in pool[:max_candidates]]
     emit_output(
         {
             "status": "MULTIPLE_MATCHES",
             "cwd": resolved_cwd_display,
-            "candidates": [
-                {
-                    "thread_id": m["thread_id"],
-                    "short_id": m["thread_id"][:8],
-                    "model": m.get("model", ""),
-                    "reasoning_effort": m.get("reasoning_effort", ""),
-                    "last_active_local": m["last_active_local"],
-                    "session_timestamp": m["session_timestamp"],
-                    "first_user_message": m.get("first_user_message", ""),
-                    "branch": m["branch"],
-                    "originator": m["originator"],
-                    "source": m["source"],
-                }
-                for m in limited
-            ],
+            "candidates": [serialize_candidate(m) for m in limited],
             "note": (
                 "Multiple Codex sessions matched this project root. Present numbered candidates "
-                "(UUID short code, model, last active time, first message summary) plus option [0] "
-                "to launch a new Codex window, then pin via --select <UUID> or run start_codex_window.py --force-new."
+                "(UUID short code, model, reasoning effort, last active time, first message summary) plus option [0] "
+                "to launch a new Codex session, then pin via --select <UUID> or run start_codex_window.py --force-new."
             ),
         },
         args.json,

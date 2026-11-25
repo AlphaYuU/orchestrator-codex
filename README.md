@@ -6,11 +6,11 @@ A dual-window Agent Skill where **Antigravity (Gemini)** serves as orchestrator 
 
 ## 使用方式 / How to Use
 
-1. **在项目打开 Antigravity (Gemini) 提需求**：无需手动开终端；若你已在同项目手动打开过 Codex CLI 并发送过 `hi`，Gemini 也会直接识别并复用。
+1. **在项目打开 Antigravity (Gemini) 提需求**：无需手动开终端；若你已在同项目手动打开过 Codex CLI 并发送过 `hi`，Gemini 也会直接识别并复用。支持按需恢复先前的 Codex 会话（需要接续旧上下文时告知 Gemini 列出历史会话选择恢复即可）。
 2. **对齐需求、分支与配置**：需要新开 Codex 窗口时，按提示补充模型与思考强度（安全权限按任务模式自动推荐），Gemini 会弹出独立新窗口并自动绑定 UUID；中途既可在右侧窗口直接输入 `/model` 原地切换，也可让 Gemini 重开新窗重配。
 3. **自动派单与 Diff 验收**：Gemini 派单后自动轮询完工（若 Codex 遇歧义挂起，Gemini 会转述选项向你请示），完成后自动核查 `git diff`、新增文件与测试并汇报，不通过会自动打回修改（最多 3 轮）。
 
-1. **Prompt Antigravity (Gemini) in your repo**: No need to open a terminal manually — and if you already have a Codex CLI window open in the same repo (initialized with `hi`), Gemini will detect and reuse it directly.
+1. **Prompt Antigravity (Gemini) in your repo**: No need to open a terminal manually — and if you already have a Codex CLI window open in the same repo (initialized with `hi`), Gemini will detect and reuse it directly. Supports resuming a previous Codex session on demand (just ask Gemini to list historical sessions and choose one whenever you want to continue prior context).
 2. **Align scope, branch, and window config**: When a new Codex window is needed, specify your model and reasoning effort from the real local list (safety permissions are recommended automatically by task mode). Gemini opens a standalone window and binds its UUID; mid-session you can switch in place with `/model` in the right window or ask Gemini to open a reconfigured window.
 3. **Auto-dispatch and Diff acceptance review**: Gemini polls until completion (escalating to you if Codex blocks on ambiguity), then independently verifies `git diff`, new untracked files, and tests before reporting back — automatically requesting fixes on failure (up to 3 rounds).
 
