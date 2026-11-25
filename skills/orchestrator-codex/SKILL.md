@@ -19,7 +19,7 @@ description: >-
 
 # Orchestrator-Codex Dual-Window Subagent Workflow
 
-Gemini (Antigravity) is the **Orchestrator Lead, Sole Human Interface, and Frontend/Aesthetic Owner**. Codex CLI (in an adjacent visible window on main desktop, or safely hosted in background `conhost.exe` on an isolated sandbox desktop) is strictly Gemini's **behind-the-scenes Backend Subagent**, driven via `codex queue` using resolved session **UUIDs**.
+Gemini (Antigravity) is the **Orchestrator Lead, Sole Human Interface, and Frontend/Aesthetic Owner**. Codex CLI (in a standalone visible window on the main desktop, or safely hosted in background `conhost.exe` on an isolated sandbox desktop) is strictly Gemini's **behind-the-scenes Backend Subagent**, driven via `codex queue` using resolved session **UUIDs**.
 
 ## 1. Highest-Priority Principles: Sole Interface & Ask-Don't-Guess
 
@@ -32,7 +32,7 @@ Gemini (Antigravity) is the **Orchestrator Lead, Sole Human Interface, and Front
    - **Error Codes vs. UI Copy**: Backend returns structured error codes + machine params ONLY; Codex NEVER authors user-facing UI copy.
 5. **User-Owned Model, Effort & Permission Control**:
    - **New / Reopened / Resumed Session**: Model and reasoning effort MUST always be explicitly chosen by the user from real local models (`start_codex_window.py --list-models`). Never pick on the user's behalf, guess model names, or fall back to `config.toml` defaults.
-   - **Subsequent Dispatches (`codex queue` / fallback `codex exec`)**: **NEVER pass `-m`, `--model`, `-c model=...`, `-c model_reasoning_effort=...`, or `-c service_tier=...` override flags**, so in-place `/model` and `/permissions` changes made inside a visible right-hand Codex window stay active.
+   - **Subsequent Dispatches (`codex queue` / fallback `codex exec`)**: **NEVER pass `-m`, `--model`, `-c model=...`, `-c model_reasoning_effort=...`, or `-c service_tier=...` override flags**, so in-place `/model` and `/permissions` changes made inside a visible Codex window stay active.
 
 ## 2. Architecture Blueprint & Tiered Git Branch Governance
 
@@ -101,7 +101,7 @@ Applies whenever `NOT_FOUND`, `SANDBOX_SESSION_OFFLINE`, user picks `[0]`, or us
 
 ### Mid-Session Switching & Safe Background Cleanup
 
-- **Mode 1 — In-Place Switch (Visible Window)**: User types `/model` or `/permissions` directly in the right-hand window; `codex queue --thread "<UUID>"` never passes override flags, so changes persist with full context.
+- **Mode 1 — In-Place Switch (Visible Window)**: User types `/model` or `/permissions` directly in the Codex window; `codex queue --thread "<UUID>"` never passes override flags, so changes persist with full context.
 - **Mode 2 — Reconfigure via Gemini (`--force-new`)**: Confirm explicit model & effort, then run `start_codex_window.py ... --force-new`. If the old session is `SANDBOX_BACKGROUND`, the script automatically verifies PID + process name + creation-time fingerprint and cleans it up before launching; if the old session is `VISIBLE_WINDOW`, leave it idle for the user to close manually (**never force-kill visible windows**).
 - **Explicit Stop (`--stop`)**: To shut down a managed background Codex session cleanly (verified by PID + allowlisted name + creation-time fingerprint), run:
   ```bash
